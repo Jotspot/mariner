@@ -1,0 +1,10 @@
+#!/bin/bash
+# NetworkManager dispatcher: re-run the captive portal check whenever the
+# uplink changes or NM's own connectivity state changes.
+case "$1:$2" in
+    wlan0:up|wlan0:down|wlan0:dhcp4-change|*:connectivity-change)
+        # Give DHCP/DNS a moment to settle; the timer also catches anything missed.
+        systemd-run --quiet --no-block --on-active=3s --unit="mariner-check-nm-$$" \
+            /usr/local/lib/mariner/bin/mariner-check --quiet ;;
+esac
+exit 0

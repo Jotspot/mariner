@@ -1,0 +1,19 @@
+#!/bin/bash
+# Snapshot the current state and schedule an automatic restore.
+#   arm-rollback [minutes]   -> snapshot + timer (default 3 min)
+#   arm-rollback cancel      -> cancel a pending restore
+set -euo pipefail
+UNIT=mariner-rollback
+
+if [ "${1:-}" = cancel ]; then
+    systemctl stop "$UNIT.timer" 2>/dev/null && echo "rollback cancelled" || echo "no rollback pending"
+    exit 0
+fi
+
+MIN=${1:-3}
+SNAP=$(/usr/local/lib/mariner/bin/mariner-snapshot)
+systemctl stop "$UNIT.timer" 2>/dev/null || true
+systemctl reset-failed "$UNIT.service" 2>/dev/null || true
+systemd-run --quiet --unit="$UNIT" --on-active="${MIN}min" \
+    /usr/local/lib/mariner/bin/mariner-restore "$SNAP"
+echo "rollback to $SNAP armed for ${MIN} min (cancel: arm-rollback cancel)"

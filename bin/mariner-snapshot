@@ -1,0 +1,20 @@
+#!/bin/bash
+# Save the current network + firewall state so it can be restored by
+# mariner-restore. Prints the snapshot directory on stdout.
+set -euo pipefail
+
+SNAP=/var/lib/mariner/snap-$(date +%Y%m%d-%H%M%S)
+mkdir -p "$SNAP"
+chmod 700 "$SNAP"
+
+cp -a /etc/NetworkManager/system-connections "$SNAP/nm-connections"
+cp -a /etc/netplan "$SNAP/netplan"
+[ -d /etc/NetworkManager/dnsmasq-shared.d ] && cp -a /etc/NetworkManager/dnsmasq-shared.d "$SNAP/dnsmasq-shared.d"
+nft list ruleset > "$SNAP/nft.rules"
+ip rule save > "$SNAP/ip-rules.bin"
+ip -br link > "$SNAP/links.txt"
+
+# Keep the 10 newest snapshots (they contain Wi-Fi passwords).
+ls -1d /var/lib/mariner/snap-* 2>/dev/null | sort | head -n -10 | xargs -r rm -rf
+
+echo "$SNAP"

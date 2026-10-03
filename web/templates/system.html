@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% from "macros.html" import csrf_field with context %}
+{% block heading %}System{% endblock %}
+{% block topaction %}
+<form method="post" action="/logout" class="inline" data-full>{{ csrf_field(csrf) }}
+  <button class="btn text" type="submit">{{ icon("logout") }}Sign out</button></form>
+{% endblock %}
+{% block content %}
+<div class="layout cols-wide">
+<div class="col">
+  <h2 class="title-m section-title">Recent logs</h2>
+  <section class="card">
+    <nav class="tabs" aria-label="Log source">
+      {% for key, label in [("mariner", "Mariner"), ("vpn", "VPN"), ("network", "Network")] %}
+      <a class="chip {{ 'info' if log == key }}" href="/system?log={{ key }}"{% if log == key %} aria-current="page"{% endif %}>{{ label }}</a>
+      {% endfor %}
+    </nav>
+    <pre class="log mt">{% for l in lines|reverse %}{{ l }}
+{% else %}No log entries.{% endfor %}</pre>
+    <p class="body-s mt">Newest first.</p>
+  </section>
+
+</div>
+<div class="col">
+  <h2 class="title-m section-title">Services</h2>
+  <section class="card">
+    <ul class="list">
+      {% for key, label, note in [("vpn", "VPN", "Reconnects the VPN you are using"), ("network", "Network", "Restarts NetworkManager; Wi-Fi and the hotspot drop for ~20 s"), ("portal", "Control panel", "This web page")] %}
+      <li class="item"><div class="grow"><p class="label-l">{{ label }}</p><p class="body-s">{{ note }}</p></div>
+        <form method="post" action="/system/restart" class="inline">{{ csrf_field(csrf) }}<input type="hidden" name="service" value="{{ key }}">
+          <button class="btn outlined" type="submit">{{ icon("refresh") }}Restart</button></form></li>
+      {% endfor %}
+    </ul>
+  </section>
+
+  <h2 class="title-m section-title">Control panel password</h2>
+  <form class="card" method="post" action="/system/password">
+    {{ csrf_field(csrf) }}
+    <label class="field"><span>Current password</span><input type="password" name="current" required autocomplete="current-password"></label>
+    <label class="field"><span>New password</span><input type="password" name="password" minlength="8" required autocomplete="new-password"></label>
+    <label class="field"><span>Confirm new password</span><input type="password" name="confirm" minlength="8" required autocomplete="new-password"></label>
+    <div class="card-actions"><button class="btn tonal" type="submit">Change password</button></div>
+  </form>
+
+  <h2 class="title-m section-title">Wi-Fi chip</h2>
+  <section class="card" data-live="sys-radio">
+    <dl class="kv">
+      <dt>Firmware</dt><dd>{{ radio.firmware or "?" }}</dd>
+      <dt>Crashes since boot</dt><dd>{{ radio.crashes_this_boot or 0 }}{% if radio.last_crash %} (last {{ radio.last_crash|since }} ago){% endif %}</dd>
+    </dl>
+    <p class="body-s mt">The built-in Broadcom chip runs the uplink and the hotspot at once. Under load its firmware can crash; it restarts by itself in about 15 seconds. Crash details are in the Network log.</p>
+  </section>
+
+  <section class="card error">
+    <div class="card-head top"><div class="avatar bad">{{ icon("power") }}</div>
+      <div class="grow"><p class="title-m">Restart or power off</p>
+        <p class="body-m"><b>Reboot</b> takes about a minute; your devices reconnect on their own.
+          <b>Power off</b> shuts Mariner down safely before you unplug it. To turn it back on, unplug and plug in the power again.</p></div></div>
+    <div class="card-actions">
+      <form method="post" action="/system/poweroff" class="inline"
+            data-confirm="Power off Mariner? The hotspot and internet stop. To turn it back on, unplug and replug the power.">{{ csrf_field(csrf) }}
+        <button class="btn outlined" type="submit">{{ icon("power") }}Power off</button></form>
+      <form method="post" action="/system/reboot" class="inline" data-confirm="Reboot Mariner now?">{{ csrf_field(csrf) }}
+        <button class="btn danger" type="submit">{{ icon("refresh") }}Reboot</button></form>
+    </div>
+  </section>
+</div>
+</div>
+{% endblock %}

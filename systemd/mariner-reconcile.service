@@ -1,0 +1,14 @@
+[Unit]
+Description=Mariner: apply VPN routing, kill switch and firewall state
+After=NetworkManager.service nftables.service
+Wants=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/mariner/bin/mariner-ctl reconcile
+# reconcile logs a readable line itself; don't dump its JSON result.
+StandardOutput=null
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target

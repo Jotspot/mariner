@@ -1,0 +1,54 @@
+{% from "icons.html" import icon with context %}
+
+{% macro uplink_chip(state) -%}
+{% if state == "online" %}<span class="chip ok">{{ icon("check") }}Online</span>
+{% elif state == "portal" %}<span class="chip warn">{{ icon("web") }}Login needed</span>
+{% elif state == "offline" %}<span class="chip bad">{{ icon("wifi_off") }}Offline</span>
+{% else %}<span class="chip">Checking…</span>{% endif %}
+{%- endmacro %}
+
+{% macro vpn_chip(v) -%}
+{% if v.mode == "off" %}<span class="chip">Off</span>
+{% elif v.mode == "paused-portal" %}<span class="chip warn">Paused for login</span>
+{% elif v.mode == "no-credentials" %}<span class="chip warn">Not set up</span>
+{% elif v.connection == "connected" %}<span class="chip ok">{{ icon("lock") }}Protected</span>
+{% elif v.connection == "bad-credentials" %}<span class="chip bad">Account rejected</span>
+{% elif v.connection == "unreachable" %}<span class="chip bad">Server unreachable</span>
+{% elif v.connection == "restarting" %}<span class="chip warn">Restarting</span>
+{% else %}<span class="chip info">Connecting…</span>{% endif %}
+{%- endmacro %}
+
+{# "🇱🇹 Lithuania · Šiauliai": where hotspot traffic comes out while the VPN is connected. #}
+{% macro vpn_exit_line(v, big=False) -%}
+{% if v.provider == "expressvpn" and v.expressvpn and v.expressvpn.switching_to %}
+<p class="exit-line {{ 'big' if big }} pending-line"><span class="flag" aria-hidden="true">{{ v.expressvpn.switching_to|region_flag }}</span>
+  <span><span class="muted">Switching to</span> {{ v.expressvpn.switching_to|region_label }}…</span></p>
+{% else %}
+{% if v.connection == "connected" and v.exit and v.exit.region %}
+{# ExpressVPN: its own location name is authoritative (IP databases often misplace VPN exits). #}
+<p class="exit-line {{ 'big' if big }}"><span class="flag" aria-hidden="true">{{ v.exit.region|region_flag }}</span>
+  <span>{{ v.exit.region|region_label }}</span></p>
+{% elif v.connection == "connected" and v.exit and v.exit.country %}
+<p class="exit-line {{ 'big' if big }}"><span class="flag" aria-hidden="true">{{ v.exit.country|flag }}</span>
+  <span>{{ v.exit.country|country }}{% if v.exit.city %}<span class="muted"> · {{ v.exit.city }}</span>{% endif %}</span></p>
+{% endif %}
+{% endif %}
+{%- endmacro %}
+
+{% macro csrf_field(csrf) -%}<input type="hidden" name="csrf" value="{{ csrf }}">{%- endmacro %}
+
+{% macro portal_banner(up, csrf) -%}
+{% if up and up.state == "portal" %}
+<div class="card tertiary banner">
+  {{ icon("web") }}
+  <div class="grow">
+    <p class="title-m">This network needs you to log in</p>
+    <p class="body-m">{% if up.ssid %}{{ up.ssid }} has{% else %}The network has{% endif %} a login page. Open it, accept the terms or sign in, and Mariner will pick up the connection automatically.</p>
+    <div class="card-actions">
+      <a class="btn outlined" href="/portal">Details</a>
+      <a class="btn filled" href="{{ up.portal_url }}" target="_blank" rel="noopener noreferrer">{{ icon("open") }}Open login page</a>
+    </div>
+  </div>
+</div>
+{% endif %}
+{%- endmacro %}

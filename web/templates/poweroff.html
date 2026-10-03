@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+{% block title %}Powering off · Mariner{% endblock %}
+{% block body %}
+<div class="center">
+  <div class="card tc">
+    <div class="logo-big">{{ icon("power") }}</div>
+    <h1 class="headline">Powering off…</h1>
+    <p class="body-m">Mariner is shutting down. Give it about 20 seconds, until the Pi's green light stops flickering, then it's safe to unplug.</p>
+    <p class="body-m mt">To turn it back on, plug the power back in. It's ready again after about a minute.</p>
+  </div>
+</div>
+{% endblock %}

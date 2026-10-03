@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% from "macros.html" import uplink_chip, vpn_chip, vpn_exit_line, csrf_field, portal_banner with context %}
+{% block meta %}<noscript><meta http-equiv="refresh" content="{{ 10 if v.enabled and v.connection != 'connected' else 30 }}"></noscript>{% endblock %}
+{% block content %}
+{% set up = st.uplink or {} %}{% set hs = st.hotspot or {} %}{% set direct = (st.public_ip or {}).direct %}{% set link = up.link or {} %}
+{% if ctl_error %}<div class="snackbar error" role="alert">{{ icon("warning") }}<span>{{ ctl_error }}</span></div>{% endif %}
+<div class="layout cols-2">
+  <div class="span-all live-slot" data-live="dash-banner">{% if up.state == "portal" %}{{ portal_banner(up, csrf) }}{% endif %}</div>
+
+  <section class="card {{ 'primary' if v.connection == 'connected' }}" data-live="dash-vpn">
+    <div class="card-head">
+      <div class="avatar {{ 'on' if v.connection == 'connected' else ('bad' if v.connection in ('bad-credentials', 'unreachable') else ('warn' if v.mode in ('paused-portal', 'no-credentials') or v.enabled else '')) }}">{{ icon("shield") }}</div>
+      <div class="grow">
+        <p class="body-s">VPN · {{ v.provider_name }}</p>
+        <p class="title-m">{% if v.connection == "connected" %}Protected{% elif v.enabled %}{{ v.detail }}{% else %}Off: traffic goes direct{% endif %}</p>
+      </div>
+      <form method="post" action="/vpn/toggle" class="inline">
+        {{ csrf_field(csrf) }}<input type="hidden" name="on" value="{{ '0' if v.enabled else '1' }}"><input type="hidden" name="next" value="/">
+        <button class="switch {{ 'on' if v.enabled }}" type="submit" role="switch" aria-checked="{{ 'true' if v.enabled else 'false' }}" aria-label="VPN"></button>
+      </form>
+    </div>
+    {{ vpn_exit_line(v, big=True) }}
+    <dl class="kv mt">
+      {% if v.connection != "connected" %}<dt>Status</dt><dd>{{ vpn_chip(v) }}</dd>{% endif %}
+      {% if v.connected_since %}<dt>Connected for</dt><dd>{{ v.connected_since|since }}</dd>{% endif %}
+      {% if v.exit and v.exit.ip %}<dt>Exit IP</dt><dd class="mono">{{ v.exit.ip }}</dd>{% endif %}
+      <dt>Kill switch</dt><dd>{{ ("On" if v.blocking_direct else "Paused for login") if v.enabled and v.killswitch else "Off" }}</dd>
+      <dt>Hotspot DNS</dt><dd>{{ ("Through the " ~ v.provider_name ~ " tunnel" if v.provider == "expressvpn" else "Encrypted via " ~ v.provider_name) if v.dns_via_vpn else "Network's own DNS" }}</dd>
+    </dl>
+    <div class="card-actions"><a class="btn text" href="/vpn">VPN settings</a></div>
+  </section>
+
+  <section class="card" data-live="dash-uplink">
+    <div class="card-head">
+      <div class="avatar {{ 'on' if up.state == 'online' else ('warn' if up.state == 'portal' else 'bad') }}">{{ icon("wifi" if up.state != "offline" else "wifi_off") }}</div>
+      <div class="grow">
+        <p class="body-s">Internet from</p>
+        <p class="title-m">{{ up.ssid or "Not connected" }}</p>
+      </div>
+      {{ uplink_chip(up.state) }}
+    </div>
+    <dl class="kv">
+      {% if link.band %}<dt>Radio</dt><dd>{{ link.band }} · channel {{ link.channel }}{% if link.signal_dbm %} · {{ link.signal_dbm }} dBm{% endif %}</dd>{% endif %}
+      {% if direct and direct.country %}<dt>Network location</dt><dd><span class="flag-inline">{{ direct.country|flag }}</span> {{ direct.country|country }}</dd>{% endif %}
+      {% if direct and direct.ip %}<dt>Direct IP</dt><dd class="mono">{{ direct.ip }}</dd>{% endif %}
+      {% if up.detail and up.state != "online" %}<dt>Status</dt><dd>{{ up.detail }}</dd>{% endif %}
+    </dl>
+    <div class="card-actions">
+      <form method="post" action="/public-ip" class="inline">{{ csrf_field(csrf) }}
+        <button class="btn text" type="submit" data-busy="Checking…">{{ icon("refresh") }}Check IPs</button></form>
+      <a class="btn text" href="/wifi">Change network</a>
+    </div>
+  </section>
+
+  <section class="card" data-live="dash-hotspot">
+    <div class="card-head">
+      <div class="avatar">{{ icon("tethering") }}</div>
+      <div class="grow"><p class="body-s">Hotspot</p><p class="title-m">{{ hs.ssid or "—" }}</p></div>
+      <a class="chip" href="/hotspot" aria-label="{{ hs.clients or 0 }} devices connected">{{ icon("devices") }}{{ hs.clients or 0 }}</a>
+    </div>
+    <dl class="kv">
+      <dt>Band</dt><dd>{{ {"a": "5 GHz", "bg": "2.4 GHz"}.get(hs.band, hs.band) }}{% if hs.channel %} · channel {{ hs.channel }}{% endif %}</dd>
+      <dt>Address</dt><dd class="mono">10.42.0.1</dd>
+    </dl>
+    {% if hs.sync and hs.sync.status == "dfs" %}
+    <p class="body-m mt">{{ icon("warning") }} {{ hs.sync.note }}.</p>
+    {% endif %}
+  </section>
+
+  <div class="live-slot span-all" data-live="dash-radio">{% if st.radio and st.radio.crashes_this_boot %}
+  <section class="card tertiary">
+    <div class="card-head top">
+      <div class="avatar warn">{{ icon("warning") }}</div>
+      <div class="grow"><p class="title-m">Wi-Fi chip restarted</p>
+        <p class="body-m">The Pi's Wi-Fi firmware crashed {{ st.radio.crashes_this_boot }} time{{ "s" if st.radio.crashes_this_boot != 1 }} since boot (last {{ st.radio.last_crash|since }} ago) and recovered by itself. Devices may have dropped briefly.</p></div>
+    </div>
+  </section>
+  {% endif %}</div>
+</div>
+{% endblock %}

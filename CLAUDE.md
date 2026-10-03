@@ -1,0 +1,48 @@
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+
+Mariner turns a Raspberry Pi 4 (Debian 13, NetworkManager, nftables) into a travel router: it joins hotel Wi-Fi on `wlan0`, runs a hotspot on `uap0`, detects captive portals, and optionally sends hotspot traffic through Geph, Outline or ExpressVPN with a kill switch. A phone-friendly web portal at `http://mariner.local` (10.42.0.1, hotspot only) controls it. **README.md is the detailed design doc. Read the relevant section before changing a subsystem.**
+
+## Working on the Pi
+
+- This checkout lives on a Windows PC; the code runs on the Pi. Reach the Pi over **ethernet** with `ssh -o BatchMode=yes <user>@<pi-ethernet-ip>` (key auth, passwordless sudo); the dev Pi's address is kept out of the repo. Never use the Pi's `wlan0` address: network changes can cut that session off, and SSH is firewalled off `wlan0` anyway.
+- Deploy: commit here, `git push pi main` (the remote is `/opt/mariner`, with `receive.denyCurrentBranch=updateInstead`), then `ssh ... 'sudo /opt/mariner/install.sh'`. `install.sh` is idempotent: it copies to `/usr/local/lib/mariner` (root-owned), installs units and NM config, and restarts the portal. Code under `/opt/mariner` is never executed directly.
+- The user's own internet usually goes through this Pi. Before any network or firewall change, arm the automatic rollback and cancel it only after a fresh SSH session works: `sudo arm-rollback <minutes>` … `sudo arm-rollback cancel`. Pick a window longer than the change can take: a fired rollback restarts NetworkManager and drops the hotspot.
+- Never print secrets. Don't cat `/etc/mariner/*` (vpn.json, geph.yaml, outline.json, portal.json), `/opt/expressvpn/var/*`, `/etc/netplan/*`, `/etc/NetworkManager/system-connections/*`. JSON files defeat line-based `sed` redaction; extract only the fields you need with `jq`.
+- `/tmp` on the Pi is a ~900 MB RAM disk, too small for builds (e.g. `cargo install --target-dir ~/.cache/...`).
+- Windows quirks: Windows PowerShell strips inner double quotes when passing args to `ssh`, so for commands the user must type, put a script on the Pi instead of complex quoting. Writing Python that contains `\0`/`\\` via bash heredocs mangles escapes; write the patch to a file in the scratchpad and run it.
+
+## Checks and tests
+
+There's no unit-test suite or linter. Syntax-check locally, then test on the Pi:
+- `python -c "import ast; ast.parse(open('bin/mariner-ctl', encoding='utf-8').read())"` (same for `bin/mariner-check`, `bin/mariner-dns`, `web/app.py`). Compile all Jinja templates with a `jinja2.Environment(loader=FileSystemLoader('web/templates'))` after registering the custom filters from `web/app.py` (`flag`, `country`, `bytes`, `since`, `date`, `duration`, `region_label`, `region_flag`, `org`).
+- On the Pi, as root:
+  - `tests/hotspot-client.sh up|run CMD|down`: a fake phone (netns `mclient`, 10.42.0.250) on veth `mtest0`, which `mariner-ctl` treats exactly like `uap0`. Use it for routing, kill-switch and DNS-leak checks (`tcpdump` on `wlan0`/`eth0` while the client runs queries).
+  - `tests/fake-portal.sh on [redirect|meta]|off`: makes `mariner-check` see a captive portal.
+  - `tests/outline-selftest.sh`: Outline key parsing and sslocal against a throwaway local Shadowsocks server, without touching the live VPN.
+- `python tests/portal-sim/portal_sim.py` (stdlib, runs on Windows too, ~10 s): 108 simulated captive-portal/network scenarios against the real `bin/mariner-check` code. Run it after any change to `mariner-check`; exit code 1 on failure.
+- Installer (`bootstrap.sh`): test in a throwaway `systemd-nspawn` container on the Pi (debootstrap trixie into `/var/lib/machines/<name>`, `VirtualEthernet=yes` plus a host NAT table, repo bind-mounted read-only, `--repo /src/mariner`). Never test it on the live host. `--dry-run` shows the plan. For the hotspot path, `modprobe mac80211_hwsim radios=1` on the host (with an NM `unmanaged-devices=driver:mac80211_hwsim` conf first), move the phy in with `iw phy <phy> set netns <container leader pid>` and rename it `wlan0` inside. Interactive runs are scripted through `script -qfec` with answers fed on stdin. The installer is interactive by default (questions read from `/dev/tty`); `--yes` makes it unattended. Everything runs inside `main()` so `curl | bash` can't feed later script lines to a command reading stdin. Under `set -o pipefail`, avoid `producer | grep -q`/`head` (SIGPIPE makes the pipeline fail).
+- Portal pages can be fetched on the Pi with a minted session: `cd /usr/local/lib/mariner/web && sudo /usr/local/lib/mariner/venv/bin/python -c "import app; print(app.make_cookie(app.portal_cfg()))"`, then `curl -b "mariner_session=…" http://10.42.0.1/…`. To view the portal from the PC, use `ssh -L 18080:10.42.0.1:80 …`.
+
+## Architecture (the parts that span files)
+
+- **`bin/mariner-ctl` is the only privileged entry point.** The portal (user `mariner`) may run exactly this via sudo (`/etc/sudoers.d/mariner-web`). Each subcommand validates its input; secrets arrive as JSON on **stdin**; output is JSON (`{"error": ...}` + exit 1 on failure). Systemd units, `mariner-check` and the portal all go through it.
+- **`reconcile()` in `mariner-ctl` is the VPN state machine.** It runs from boot (`mariner-firewall-early.service` with `--no-units` before NM, then `mariner-reconcile.service`), after every `mariner-check` run (every 60 s plus NM dispatcher events), after every settings change, and from `mariner-tun` ExecStopPost. It must **fail closed**: if the kill switch should be on it applies blocking rules first, then manages units, then always re-applies routing and nft. It regenerates the whole `inet mariner` nft table each time (counters reset; that's expected). Settings live in `/etc/mariner/vpn.json`; edit them only under `cfg_lock()`.
+- **Hotspot traffic is policy-routed:** `ip rule from 10.42.0.0/24 iif uap0 → table 100`, which ends in `unreachable default`, so nothing falls back to `wlan0`. The Pi's own traffic (VPN connections, captive checks) stays on the main table.
+  - **Geph/Outline:** client gives SOCKS5 on 127.0.0.1:9909 → `tun2socks` creates `vpn0` (table-100 default). Hotspot DNS is DNATed to `mariner-dns` on 10.42.0.1:5354, which does DoH over the SOCKS port.
+  - **ExpressVPN:** the official app is confined to netns `evpn` (drop-in `systemd/expressvpn-service.service.d/mariner.conf`). Table 100 routes `via 10.200.0.2 dev evh`, and a guard table inside the netns drops anything not leaving via `wgexpressvpn*`/`tun*`. DNS is DNATed to `mariner-evpn-dns` (mariner-dns in `resolv` mode) inside the netns. Status comes from one `expressvpnctl status` call, cached briefly. Mariner is the only thing that connects: autoconnect is off, settings are applied once per daemon start (`evpn_configure`), and every connect goes through `evpn_connect`, which writes `/run/mariner/evpn-switch.json` so reconcile and status leave an in-flight switch alone. The CLI goes silent while the daemon is busy; that means busy, not a state change. Turning the VPN off only disconnects. The daemon keeps running while ExpressVPN is the chosen provider, because a stop/start costs ~35 s and a connect only a few.
+- **Single shared radio:** `uap0` is a virtual AP on the same Broadcom chip as `wlan0`, so the hotspot must follow the uplink's channel (`mariner-hotspot-sync`), DFS channels can't host it, and scans/roams briefly disturb clients. The chip runs the Cypress "minimal" firmware; firmware crashes are counted in `radio_health()`.
+- **Captive portal interlock:** `mariner-check` probes Apple/Google/Microsoft URLs with sockets bound to `wlan0` (`SO_BINDTODEVICE`) and the uplink's own DNS, and writes `/run/mariner/portal.json`. In `portal` state reconcile stops the VPN but keeps the kill switch; "Allow 10 min" (`portal-login-allow`) opens a window that only applies while a portal is detected.
+- **Web portal** (`web/`, FastAPI + Jinja + hand-written Material 3 CSS, no CDN, CSP same-origin only):
+  - `StateCache` in `app.py` serves `mariner-ctl` results (stale-while-revalidate, refreshed only while someone is viewing; fast for 30 s after `cache.poke()`). Slow actions go through `run_bg()`; use `cache.patch()` for optimistic state so the page doesn't flip back.
+  - Scripted requests carry header `X-Mariner`; the middleware turns their 303 redirects (`back(path, msg, err)`) into JSON.
+  - `web/static/app.js` swaps `<main>` for navigation, refreshes elements with `data-live="id"` (keep forms the user types into outside live regions; use `data-key` on `<details>` to keep them open), and submits forms with fetch. `data-full` forces a real submit (login/setup/logout). Everything must keep working without JS.
+
+## Gotchas learned the hard way
+
+- `tun2socks` needs double-dash long flags (`--device`, `--proxy`); single-dash flags fail.
+- `journalctl -t X -u Y` ANDs the matches. Use field matches joined with `+` to OR them (`_any_of()` in `mariner-ctl`).
+- `nmcli -g a,b` prints one field per line. NetworkManager's netplan backend can't keep `interface-name` on netplan-born profiles (it saves `match: {}`).
+- NM shared mode masquerades hotspot → `evh` traffic to 10.200.0.1. Rules inside the evpn netns therefore match on `iifname "evn"`, not on 10.42.0.0/24.
+- Upgrading units: stop old units before replacing their unit files (`PartOf=` links are read from the old files), or orphaned processes survive. `install.sh` has a migrations block for this.

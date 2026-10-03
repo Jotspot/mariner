@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% from "macros.html" import uplink_chip, csrf_field, portal_banner with context %}
+{% block heading %}Wi-Fi{% endblock %}
+{% block content %}
+{% set up = st.uplink or {} %}
+<div class="layout cols-2">
+  <div class="span-all live-slot" data-live="wifi-banner">{% if up.state == "portal" %}{{ portal_banner(up, csrf) }}{% endif %}</div>
+<div class="col">
+
+  <section class="card" data-live="wifi-current">
+    <div class="card-head">
+      <div class="avatar {{ 'on' if up.state == 'online' }}">{{ icon("wifi") }}</div>
+      <div class="grow"><p class="body-s">Connected to</p><p class="title-m">{{ up.ssid or "Nothing" }}</p></div>
+      {{ uplink_chip(up.state) }}
+    </div>
+    {% if link.bssid %}
+    <dl class="kv">
+      <dt>Access point</dt><dd class="mono">{{ link.bssid }}</dd>
+      <dt>Radio</dt><dd>{{ link.band }} · channel {{ link.channel }}{% if link.signal_dbm %} · {{ link.signal_dbm }} dBm{% endif %}</dd>
+    </dl>
+    {% endif %}
+    <p class="body-s mt">Mariner's hotspot has to use the same channel as this network. When Mariner switches access point (common on mesh and hotel networks), the channel can change and your devices drop for a few seconds. To prevent that, open the network under Saved networks and turn on <b>Stay on this access point</b>.</p>
+  </section>
+
+  <h2 class="title-m section-title">Available networks</h2>
+  <section class="card">
+    {% if nets is none %}
+      <p class="body-m">Scan to see networks nearby. It takes about 10 seconds.</p>
+      <div class="card-actions">
+        <a class="btn filled" href="/wifi?scan=1">{{ icon("search") }}Scan</a>
+      </div>
+    {% elif scan_error %}
+      <p class="body-m">Scan failed: {{ scan_error }}</p>
+      <div class="card-actions"><a class="btn filled" href="/wifi?scan=1">{{ icon("refresh") }}Try again</a></div>
+    {% elif not nets %}
+      <p class="body-m">No networks found.</p>
+      <div class="card-actions"><a class="btn filled" href="/wifi?scan=1">{{ icon("refresh") }}Scan again</a></div>
+    {% else %}
+      <ul class="list">
+      {% for n in nets %}
+        <li>
+          <details class="item-expand">
+            <summary class="item">
+              {{ icon("wifi") }}
+              <div class="grow">
+                <p class="label-l">{{ n.ssid }}</p>
+                <p class="body-s">{{ n.signal }}% · {{ n.bands|join(" + ") }}{% if n.in_use %} · connected{% endif %}</p>
+              </div>
+              {% if n.secure %}{{ icon("lock") }}{% endif %}
+            </summary>
+            <form class="expand-body" method="post" action="/wifi/connect">
+              {{ csrf_field(csrf) }}<input type="hidden" name="ssid" value="{{ n.ssid }}">
+              {% if n.secure %}
+              <label class="field"><span>Password</span>
+                <input type="password" name="password" autocomplete="off" minlength="8" maxlength="63"></label>
+              <p class="body-s">Leave empty to use the saved password.</p>
+              {% endif %}
+              {% if "5 GHz" in n.bands %}
+              <label class="check"><input type="checkbox" name="band" value="bg"> Force 2.4 GHz</label>
+              {% endif %}
+              <div class="card-actions">
+                <button class="btn filled" type="submit" data-busy="Connecting…">Connect</button>
+              </div>
+            </form>
+          </details>
+        </li>
+      {% endfor %}
+      </ul>
+      <div class="card-actions"><a class="btn text" href="/wifi?scan=1">{{ icon("refresh") }}Scan again</a></div>
+    {% endif %}
+  </section>
+
+</div>
+<div class="col">
+  <h2 class="title-m section-title">Saved networks</h2>
+  <section class="card">
+    {% if not saved %}<p class="body-m">None yet.</p>{% endif %}
+    <ul class="list">
+    {% for p in saved %}
+      <li>
+        <details class="item-expand" data-key="saved-{{ p.uuid }}">
+          <summary class="item">
+            {{ icon("wifi") }}
+            <div class="grow"><p class="label-l">{{ p.ssid or p.name }}</p>
+              <p class="body-s">{{ "Connected · " if p.active }}{{ "2.4 GHz only" if p.band == "bg" else ("5 GHz only" if p.band == "a" else "Any band") }}{{ " · locked to one access point" if p.bssid }}</p></div>
+          </summary>
+          <div class="expand-body">
+            <form method="post" action="/wifi/band">
+              {{ csrf_field(csrf) }}<input type="hidden" name="uuid" value="{{ p.uuid }}">
+              {% if p.active or p.bssid %}
+              <div class="switch-row">
+                <div class="grow"><p class="label-l">Stay on this access point</p>
+                  <p class="body-s">{% if p.bssid %}Locked to <span class="mono">{{ p.bssid }}</span>. Mariner won't roam to other access points{% if p.bssid != link.bssid %}, and only connects when that one is in range{% endif %}.{% else %}Stops Mariner hopping between access points of this network, so your devices aren't dropped.{% endif %}</p></div>
+                <button class="switch {{ 'on' if p.bssid }}" type="submit" form="lock-{{ p.uuid }}" role="switch"
+                        aria-checked="{{ 'true' if p.bssid else 'false' }}" aria-label="Stay on this access point"></button>
+              </div>
+              {% endif %}
+              <p class="body-s mt">Band</p>
+              <div class="segmented mt" role="radiogroup" aria-label="Band">
+                <label><input type="radio" name="band" value="auto" {{ "checked" if p.band != "bg" }}><span>Auto</span></label>
+                <label><input type="radio" name="band" value="bg" {{ "checked" if p.band == "bg" }}><span>2.4 GHz</span></label>
+              </div>
+              <p class="body-s mt">Force 2.4 GHz if the hotspot won't start on this network (5 GHz radar channels).</p>
+              <div class="card-actions"><button class="btn tonal" type="submit">Save band</button></div>
+            </form>
+            <form method="post" action="/wifi/lock" id="lock-{{ p.uuid }}">
+              {{ csrf_field(csrf) }}<input type="hidden" name="uuid" value="{{ p.uuid }}"><input type="hidden" name="lock" value="{{ '0' if p.bssid else '1' }}">
+            </form>
+            <form method="post" action="/wifi/forget" data-confirm="Forget {{ p.ssid or p.name }}?">
+              {{ csrf_field(csrf) }}<input type="hidden" name="uuid" value="{{ p.uuid }}">
+              <div class="card-actions"><button class="btn text" type="submit">{{ icon("delete") }}Forget</button></div>
+            </form>
+          </div>
+        </details>
+      </li>
+    {% endfor %}
+    </ul>
+  </section>
+</div>
+</div>
+{% endblock %}

@@ -1,0 +1,15 @@
+[Unit]
+Description=Mariner: tun2socks (vpn0 -> VPN SOCKS5 on 127.0.0.1:9909)
+PartOf=mariner-vpn-geph.target mariner-vpn-outline.target
+After=geph5.service outline-ss.service
+
+[Service]
+ExecStart=/usr/local/bin/tun2socks --device tun://vpn0 --proxy socks5://127.0.0.1:9909 \
+    --loglevel warn --tun-post-up /usr/local/lib/mariner/bin/mariner-tun-up
+# vpn0 is gone now; re-apply routing/firewall (kill switch keeps blocking).
+ExecStopPost=/bin/sh -c '/usr/local/lib/mariner/bin/mariner-ctl reconcile --no-units >/dev/null'
+Restart=always
+RestartSec=3
+# tun2socks ignores SIGTERM; don't let a stop hang for systemd's 90 s default.
+KillSignal=SIGINT
+TimeoutStopSec=5

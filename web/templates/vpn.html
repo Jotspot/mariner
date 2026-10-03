@@ -1,0 +1,206 @@
+{% extends "base.html" %}
+{% from "macros.html" import vpn_chip, vpn_exit_line, csrf_field with context %}
+{% block heading %}VPN{% endblock %}
+{% block meta %}{% if v.enabled and v.connection != "connected" %}<noscript><meta http-equiv="refresh" content="10"></noscript>{% endif %}{% endblock %}
+{% block content %}
+<div class="layout cols-2">
+<div class="col">
+  <section class="card {{ 'primary' if v.connection == 'connected' }}" data-live="vpn-status">
+    <div class="switch-row">
+      <div class="avatar {{ 'on' if v.connection == 'connected' else ('bad' if v.connection in ('bad-credentials', 'unreachable') else ('warn' if v.enabled else '')) }}">{{ icon("shield") }}</div>
+      <div class="grow">
+        <p class="body-s">{{ v.provider_name }}</p>
+        <p class="title-m">{{ "On" if v.enabled else "Off" }}</p>
+      </div>
+      <form method="post" action="/vpn/toggle" class="inline">
+        {{ csrf_field(csrf) }}<input type="hidden" name="on" value="{{ '0' if v.enabled else '1' }}">
+        <button class="switch {{ 'on' if v.enabled }}" type="submit" role="switch" aria-checked="{{ 'true' if v.enabled else 'false' }}" aria-label="VPN" {{ "disabled" if not v.has_credentials and not v.enabled }}></button>
+      </form>
+    </div>
+    <div class="exit-hero mt">
+      {{ vpn_chip(v) }}
+      {{ vpn_exit_line(v, big=True) }}
+      {% if v.connection != "connected" %}<p class="body-m">{{ v.detail }}</p>{% endif %}
+    </div>
+    <dl class="kv mt">
+      {% if v.connected_since %}<dt>Connected for</dt><dd>{{ v.connected_since|since }}</dd>{% endif %}
+      {% if v.exit and v.exit.ip %}<dt>Exit IP</dt><dd class="mono">{{ v.exit.ip }}</dd>{% endif %}
+      {% if v.exit and v.exit.org %}<dt>Network</dt><dd>{{ v.exit.org|org }}</dd>{% endif %}
+      {% if v.protocol %}<dt>Protocol</dt><dd>{{ v.protocol }}{% if v.sessions %} · {{ v.sessions }} link{{ "s" if v.sessions != 1 }}{% endif %}</dd>{% endif %}
+      {% if v.load is not none %}<dt>Exit server load</dt><dd>{{ (v.load * 100)|round|int }}%</dd>{% endif %}
+      {% if v.traffic %}<dt>Data this session</dt><dd>↓ {{ v.traffic.rx|bytes }} · ↑ {{ v.traffic.tx|bytes }}</dd>{% endif %}
+      {% if v.provider == "expressvpn" and v.expressvpn.region == "smart" %}<dt>Location</dt><dd>Smart location (picked by ExpressVPN)</dd>{% endif %}
+      {% if v.account %}<dt>Geph account</dt><dd>{% if v.account.level == "plus" %}Plus{% if v.account.plus_expires %} until {{ v.account.plus_expires|date }}{% endif %}{% else %}Free{% endif %}</dd>{% endif %}
+      <dt>Kill switch</dt><dd>{{ ("blocking direct traffic" if v.blocking_direct else "paused for login") if v.enabled and v.killswitch else ("off" if not v.killswitch else "ready") }}</dd>
+      <dt>Hotspot DNS</dt><dd>{{ ("through the " ~ v.provider_name ~ " tunnel" if v.provider == "expressvpn" else "encrypted, via " ~ v.provider_name) if v.dns_via_vpn else "network's own DNS" }}</dd>
+    </dl>
+  </section>
+
+  <h2 class="title-m section-title">Service</h2>
+  <section class="card" data-live="vpn-service">
+    <form method="post" action="/vpn/provider">
+      {{ csrf_field(csrf) }}
+      <div class="segmented" role="radiogroup" aria-label="VPN service">
+        {% for key, label in [("geph", "Geph"), ("outline", "Outline"), ("expressvpn", "ExpressVPN")] %}
+        <button type="submit" name="provider" value="{{ key }}" class="seg {{ 'on' if v.provider == key }}"
+                aria-pressed="{{ 'true' if v.provider == key else 'false' }}">{{ label }}{% if not v.configured[key] %} <span class="seg-note">not set up</span>{% endif %}</button>
+        {% endfor %}
+      </div>
+    </form>
+    <p class="body-s mt">One VPN runs at a time. Switching reconnects; the kill switch keeps blocking direct traffic while it does.</p>
+  </section>
+
+  <section class="card" data-live="vpn-killswitch">
+    <form method="post" action="/vpn/killswitch" class="switch-row">
+      {{ csrf_field(csrf) }}<input type="hidden" name="killswitch" value="{{ '0' if v.killswitch else '1' }}">
+      <div class="grow">
+        <p class="title-m">Kill switch</p>
+        <p class="body-m">While the VPN is on, block hotspot traffic whenever the tunnel is down instead of sending it out directly.</p>
+      </div>
+      <button class="switch {{ 'on' if v.killswitch }}" type="submit" role="switch" aria-checked="{{ 'true' if v.killswitch else 'false' }}" aria-label="Kill switch"></button>
+    </form>
+  </section>
+</div>
+
+<div class="col">
+{% if v.provider == "geph" %}
+  <h2 class="title-m section-title">Geph exit location</h2>
+  <form class="card" method="post" action="/vpn/geph/exit">
+    {{ csrf_field(csrf) }}
+    <label class="field"><span>Exit location</span>
+      <select name="exit">
+        <option value="auto" {{ "selected" if v.geph.exit == "auto" }}>Automatic (fastest)</option>
+        {% set listed = [] %}
+        {% for e in exits %}
+          <option value="{{ e.country }}" {{ "selected" if v.geph.exit == e.country }}>{{ e.country|country }}: any city</option>
+          {% set _ = listed.append(e.country) %}
+          {% for c in e.cities %}{% set val = e.country ~ "/" ~ c %}
+          <option value="{{ val }}" {{ "selected" if v.geph.exit == val }}>{{ e.country|country }}: {{ c }}</option>
+          {% set _ = listed.append(val) %}
+          {% endfor %}
+        {% endfor %}
+        {% if v.geph.exit != "auto" and v.geph.exit not in listed %}<option value="{{ v.geph.exit }}" selected>{{ v.geph.exit }}</option>{% endif %}
+      </select>
+      <span class="support">{% if not exits %}The full list appears once Geph has connected.{% else %}Free accounts can only use some locations.{% endif %}</span>
+    </label>
+    <div class="card-actions"><button class="btn filled" type="submit" data-busy="Saving…">Save</button></div>
+  </form>
+
+  <h2 class="title-m section-title">Geph account</h2>
+  <section class="card">
+    {% if v.configured.geph %}
+      <div class="card-head top">
+        <div class="avatar">{{ icon("key") }}</div>
+        <div class="grow"><p class="title-m">Account saved</p>
+          <p class="body-m">{{ "Account secret" if v.geph.credential_type == "secret" else "Username and password" }}. Stored on the router only, never shown again.</p></div>
+      </div>
+      <form method="post" action="/vpn/geph/account" data-confirm="Remove your Geph account from Mariner?">
+        {{ csrf_field(csrf) }}<input type="hidden" name="kind" value="none">
+        <div class="card-actions"><button class="btn text" type="submit">{{ icon("delete") }}Remove account</button></div>
+      </form>
+      <details class="item-expand mt"><summary class="label-l">Replace account…</summary>
+    {% endif %}
+      <form method="post" action="/vpn/geph/account" class="{{ 'mt' if v.configured.geph }}">
+        {{ csrf_field(csrf) }}
+        <div class="segmented radios" role="radiogroup" aria-label="Sign-in type">
+          <label><input type="radio" name="kind" value="secret" checked><span>Account secret</span></label>
+          <label><input type="radio" name="kind" value="password"><span>Username</span></label>
+        </div>
+        <p class="body-s mt">Newer Geph accounts sign in with an account secret (a long number). Older ones use a username and password.</p>
+        <label class="field mt"><span>Account secret</span>
+          <input type="password" name="secret" autocomplete="off" inputmode="numeric"></label>
+        <label class="field"><span>Username (older accounts)</span>
+          <input type="text" name="username" autocomplete="username" autocapitalize="none"></label>
+        <label class="field"><span>Password (older accounts)</span>
+          <input type="password" name="password" autocomplete="current-password"></label>
+        <div class="card-actions"><button class="btn filled" type="submit" data-busy="Saving…">Save account</button></div>
+      </form>
+    {% if v.configured.geph %}</details>{% endif %}
+  </section>
+{% elif v.provider == "outline" %}
+  <h2 class="title-m section-title">Outline access key</h2>
+  <section class="card">
+    {% if v.outline %}
+      <div class="card-head top">
+        <div class="avatar">{{ icon("key") }}</div>
+        <div class="grow"><p class="title-m">{{ v.outline.name or "Outline server" }}</p>
+          <p class="body-m mono">{{ v.outline.server }}:{{ v.outline.port }}</p></div>
+      </div>
+      <dl class="kv">
+        <dt>Encryption</dt><dd>{{ v.outline.method }}</dd>
+        <dt>Key type</dt><dd>{{ "Dynamic (ssconf://), refreshed hourly" if v.outline.dynamic else "Static (ss://)" }}</dd>
+      </dl>
+      <form method="post" action="/vpn/outline/key" data-confirm="Remove the Outline access key from Mariner?">
+        {{ csrf_field(csrf) }}<input type="hidden" name="remove" value="1">
+        <div class="card-actions"><button class="btn text" type="submit">{{ icon("delete") }}Remove key</button></div>
+      </form>
+      <details class="item-expand mt"><summary class="label-l">Replace key…</summary>
+    {% endif %}
+      <form method="post" action="/vpn/outline/key" class="{{ 'mt' if v.outline }}">
+        {{ csrf_field(csrf) }}
+        <label class="field"><span>Access key</span>
+          <input type="password" name="key" required autocomplete="off" autocapitalize="none" spellcheck="false"
+                 placeholder="ss://… or ssconf://…"></label>
+        <p class="body-s">Paste the key from the Outline app or your server admin. It's stored on the router only. Keys with a <span class="mono">prefix</span> setting aren't supported yet.</p>
+        <div class="card-actions"><button class="btn filled" type="submit" data-busy="Saving…">Save key</button></div>
+      </form>
+    {% if v.outline %}</details>{% endif %}
+  </section>
+{% else %}
+  {% set e = v.expressvpn %}
+  <h2 class="title-m section-title">ExpressVPN account</h2>
+  <section class="card">
+    {% if not e.installed %}
+      <p class="body-m">The ExpressVPN app isn't installed on this Mariner. See the README (ExpressVPN section).</p>
+    {% elif e.signed_in %}
+      <div class="card-head top">
+        <div class="avatar">{{ icon("key") }}</div>
+        <div class="grow"><p class="title-m">Signed in</p>
+          <p class="body-m">The official ExpressVPN app runs sealed off in its own network sandbox on the Pi.</p></div>
+      </div>
+      <form method="post" action="/vpn/expressvpn/logout" data-confirm="Sign this Mariner out of ExpressVPN?">
+        {{ csrf_field(csrf) }}
+        <div class="card-actions"><button class="btn text" type="submit" data-busy="Signing out…">{{ icon("logout") }}Sign out</button></div>
+      </form>
+    {% else %}
+      <form method="post" action="/vpn/expressvpn/login">
+        {{ csrf_field(csrf) }}
+        <label class="field"><span>Activation code</span>
+          <input type="password" name="code" required autocomplete="off" autocapitalize="characters" spellcheck="false"></label>
+        <p class="body-s">From expressvpn.com → Setup. Mariner hands it straight to the ExpressVPN app and doesn't keep it. Uses one of your account's device slots.</p>
+        <div class="card-actions"><button class="btn filled" type="submit" data-busy="Signing in…">Sign in</button></div>
+      </form>
+    {% endif %}
+  </section>
+
+  {% if e.installed and e.signed_in %}
+  <h2 class="title-m section-title">Location &amp; protocol</h2>
+  <form class="card" method="post" action="/vpn/expressvpn/settings">
+    {{ csrf_field(csrf) }}
+    <label class="field"><span>Location</span>
+      <select name="region">
+        <option value="smart" {{ "selected" if e.region == "smart" }}>Smart location (recommended by ExpressVPN)</option>
+        {% for country, slugs in evpn_groups %}
+          <optgroup label="{{ country }}">
+          {% for r in slugs %}
+            <option value="{{ r }}" {{ "selected" if e.region == r }}>{{ r|region_label }}</option>
+          {% endfor %}
+          </optgroup>
+        {% endfor %}
+      </select></label>
+    <label class="field"><span>Protocol</span>
+      <select name="protocol">
+        {% for key, label in [("wireguard", "WireGuard (fastest on Mariner)"), ("openvpnudp", "OpenVPN UDP"),
+                              ("openvpntcp", "OpenVPN TCP (gets through strict firewalls)"),
+                              ("lightwayudp", "Lightway UDP (very slow on a Pi 4)"), ("lightwaytcp", "Lightway TCP (very slow on a Pi 4)"),
+                              ("auto", "Automatic (ExpressVPN picks; may choose Lightway)")] %}
+        <option value="{{ key }}" {{ "selected" if e.protocol == key }}>{{ label }}</option>
+        {% endfor %}
+      </select></label>
+    <div class="card-actions"><button class="btn filled" type="submit" data-busy="Saving…">Save &amp; reconnect</button></div>
+  </form>
+  {% endif %}
+{% endif %}
+</div>
+</div>
+{% endblock %}

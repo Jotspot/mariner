@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block title %}Sign in · Mariner{% endblock %}
+{% block body %}
+<div class="center">
+  <form class="card" method="post" action="/login" data-full>
+    <div class="logo-big">{{ icon("anchor") }}</div>
+    <h1 class="headline tc">Mariner</h1>
+    <p class="body-m tc">Sign in to manage your travel router.</p>
+    {% if err %}<div class="snackbar error" role="alert">{{ icon("warning") }}<span>{{ err }}</span></div>{% endif %}
+    <label class="field"><span>Password</span>
+      <input type="password" name="password" required autocomplete="current-password" autofocus></label>
+    <button class="btn filled block" type="submit">Sign in</button>
+  </form>
+</div>
+{% endblock %}

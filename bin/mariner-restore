@@ -1,0 +1,39 @@
+#!/bin/bash
+# Restore a snapshot taken by mariner-snapshot. Normally run automatically by
+# a transient timer (see arm-rollback) if a risky change locks us out.
+set -uo pipefail
+
+SNAP=${1:?usage: mariner-restore /var/lib/mariner/snap-...}
+[ -d "$SNAP" ] || { echo "no such snapshot: $SNAP" >&2; exit 1; }
+logger -t mariner-restore "restoring $SNAP"
+
+# Interfaces that did not exist at snapshot time (e.g. uap0) are removed.
+for dev in uap0 vpn0 geph0; do
+    if ip link show "$dev" >/dev/null 2>&1 && ! grep -q "^$dev " "$SNAP/links.txt"; then
+        nmcli device disconnect "$dev" 2>/dev/null
+        ip link del "$dev" 2>/dev/null || iw dev "$dev" del 2>/dev/null
+    fi
+done
+
+rsync -a --delete "$SNAP/nm-connections/" /etc/NetworkManager/system-connections/
+rsync -a --delete "$SNAP/netplan/" /etc/netplan/
+if [ -d "$SNAP/dnsmasq-shared.d" ]; then
+    rsync -a --delete "$SNAP/dnsmasq-shared.d/" /etc/NetworkManager/dnsmasq-shared.d/
+else
+    rm -rf /etc/NetworkManager/dnsmasq-shared.d
+fi
+netplan generate
+
+nft flush ruleset
+nft -f "$SNAP/nft.rules"
+# Only Mariner's own policy rules: flushing and restoring everything would
+# duplicate the kernel's built-in rules.
+for prio in 900 $(seq 1000 1009); do
+    while ip rule del priority "$prio" 2>/dev/null; do :; done
+done
+
+systemctl restart NetworkManager
+# Re-apply the current VPN/kill-switch state on top of the restored firewall.
+sleep 5
+/usr/local/lib/mariner/bin/mariner-ctl reconcile >/dev/null 2>&1 || true
+logger -t mariner-restore "restore of $SNAP complete"

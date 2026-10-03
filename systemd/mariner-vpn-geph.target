@@ -1,0 +1,6 @@
+[Unit]
+Description=Mariner: hotspot traffic through Geph
+# Started and stopped only by `mariner-ctl reconcile`; never enabled directly
+# (mariner-reconcile.service decides at boot). Only one VPN target runs.
+Wants=geph5.service mariner-tun.service mariner-dns.service
+Conflicts=mariner-vpn-outline.target mariner-vpn-expressvpn.target

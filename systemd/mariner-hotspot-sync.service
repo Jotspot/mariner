@@ -1,0 +1,7 @@
+[Unit]
+Description=Mariner: keep hotspot on the uplink's band
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/mariner/bin/mariner-hotspot-sync

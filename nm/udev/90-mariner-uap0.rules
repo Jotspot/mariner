@@ -1,0 +1,3 @@
+# Create the hotspot interface uap0 on the onboard radio as soon as wlan0
+# appears. NetworkManager then brings up the "mariner-hotspot" profile on it.
+ACTION=="add", SUBSYSTEM=="net", KERNEL=="wlan0", RUN+="/usr/sbin/iw dev wlan0 interface add uap0 type __ap"

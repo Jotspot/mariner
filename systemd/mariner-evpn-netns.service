@@ -1,0 +1,9 @@
+[Unit]
+Description=Mariner: ExpressVPN sandbox network namespace (evpn)
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/mariner/bin/mariner-evpn-netns up
+ExecStop=/usr/local/lib/mariner/bin/mariner-evpn-netns down

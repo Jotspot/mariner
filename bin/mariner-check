@@ -1,0 +1,336 @@
+#!/usr/bin/env python3
+"""Captive portal / connectivity check for the uplink (wlan0).
+
+Asks the upstream network's own DNS server (from DHCP) for the address of
+plain-HTTP connectivity-check URLs run by different companies, then fetches
+them. Every socket is bound to wlan0 with SO_BINDTODEVICE, so the check never
+goes over ethernet, the Geph tunnel or encrypted DNS.
+
+Result, written to /run/mariner/portal.json:
+  online   every probe that answered returned the expected content
+  portal   a probe was redirected or answered with something else
+           (portal_url = where to log in)
+  offline  no uplink, no DNS, or no probe answered
+
+Usage: mariner-check [--quiet]   (needs root for SO_BINDTODEVICE)
+"""
+import fcntl
+import html
+import json
+import os
+import random
+import re
+import socket
+import struct
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urljoin, urlsplit
+
+IFACE = "wlan0"
+STATE_FILE = "/run/mariner/portal.json"
+TIMEOUT = 4.0
+PROBE_BUDGET = 8.0   # wall-clock cap for one probe (DNS + HTTP)
+
+PROBES = [
+    # name, url, expected status, expected body (None = don't check body)
+    ("apple", "http://captive.apple.com/hotspot-detect.html", 200, b"<BODY>Success</BODY>"),
+    ("google", "http://connectivitycheck.gstatic.com/generate_204", 204, None),
+    ("microsoft", "http://www.msftconnecttest.com/connecttest.txt", 200, b"Microsoft Connect Test"),
+]
+# Asked only when the three disagree: a portal intercepts everything it has not
+# whitelisted, a content filter only what it lists.
+TIEBREAK = ("firefox", "http://detectportal.firefox.com/success.txt", 200, b"success")
+
+
+def run(*cmd):
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def uplink_info():
+    """Return (connected, ssid, ipv4, [dns servers]) for wlan0 from NetworkManager."""
+    state = run("nmcli", "-g", "GENERAL.STATE", "dev", "show", IFACE)
+    dns_raw = run("nmcli", "-g", "IP4.DNS", "dev", "show", IFACE)
+    addr_raw = run("nmcli", "-g", "IP4.ADDRESS", "dev", "show", IFACE)
+    ssid = ""
+    for line in run("iw", "dev", IFACE, "link").splitlines():
+        line = line.strip()
+        if line.startswith("SSID:"):
+            ssid = line[5:].strip()
+    split = lambda s: [x.strip() for x in re.split(r"[|\n]", s) if x.strip()]
+    dns = split(dns_raw)
+    addrs = [a.split("/")[0] for a in split(addr_raw)]
+    # 100 = connected; 70 = connected but NM's own connectivity check hasn't
+    # passed yet (typical behind a captive portal), so probe in both cases.
+    connected = state.startswith("100") or state.startswith("70")
+    return connected, ssid, (addrs[0] if addrs else ""), dns
+
+
+def bound_socket(kind):
+    s = socket.socket(socket.AF_INET, kind)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, IFACE.encode())
+    s.settimeout(TIMEOUT)
+    return s
+
+
+# --- DNS (A record lookup straight to the upstream resolver) ----------------
+
+def _skip_name(buf, off):
+    while True:
+        n = buf[off]
+        if n == 0:
+            return off + 1
+        if n & 0xC0 == 0xC0:
+            return off + 2
+        off += 1 + n
+
+
+def resolve(host, servers, deadline=None):
+    """Return a list of IPv4 addresses for host, asking each server in turn."""
+    deadline = deadline or time.monotonic() + PROBE_BUDGET
+    qid = random.randint(0, 0xFFFF)
+    q = struct.pack(">HHHHHH", qid, 0x0100, 1, 0, 0, 0)
+    q += b"".join(bytes([len(p)]) + p.encode() for p in host.split(".")) + b"\0"
+    q += struct.pack(">HH", 1, 1)
+    last = "no DNS servers"
+    for server in servers[:3]:
+        try:
+            with bound_socket(socket.SOCK_DGRAM) as s:
+                s.sendto(q, (server, 53))
+                while True:  # ignore stray/spoofed replies with another ID
+                    left = min(TIMEOUT, deadline - time.monotonic())
+                    if left <= 0:
+                        raise TimeoutError("timed out")
+                    s.settimeout(left)
+                    buf, _ = s.recvfrom(4096)
+                    if buf[:2] == q[:2]:
+                        break
+        except OSError as e:
+            last = f"{server}: {e}"
+            continue
+        try:
+            return_ips = _parse_reply(buf, qid)
+        except (struct.error, IndexError, ValueError, OSError) as e:
+            last = f"{server}: malformed reply ({e})"
+            continue
+        if isinstance(return_ips, str):
+            last = f"{server}: {return_ips}"
+            continue
+        if return_ips:
+            return return_ips
+        last = f"{server}: no A record"
+    raise OSError(f"DNS failed for {host} ({last})")
+
+
+def _parse_reply(buf, qid):
+    """A records from a DNS reply, or an error string. May raise on garbage."""
+    rid, flags, qd, an = struct.unpack(">HHHH", buf[:8])
+    if rid != qid:
+        return "bad reply id"
+    if flags & 0xF:
+        return f"rcode {flags & 0xF}"
+    off = 12
+    for _ in range(qd):
+        off = _skip_name(buf, off) + 4
+    ips = []
+    for _ in range(an):
+        off = _skip_name(buf, off)
+        rtype, _cls, _ttl, rdlen = struct.unpack(">HHIH", buf[off:off + 10])
+        off += 10
+        if off + rdlen > len(buf):
+            raise ValueError("record past end of packet")
+        if rtype == 1 and rdlen == 4:
+            ips.append(socket.inet_ntoa(buf[off:off + 4]))
+        off += rdlen
+    return ips
+
+
+# --- HTTP ---------------------------------------------------------------------
+
+def _complete(data):
+    m = re.search(rb"\r?\n\r?\n", data)
+    if not m:
+        return False
+    head = data[:m.start()].decode("latin-1")
+    st = re.match(r"HTTP/\d(?:\.\d)?\s+(\d{3})", head)
+    if st and (st.group(1) in ("204", "304") or st.group(1).startswith("1")):
+        return True
+    cl = re.search(r"(?im)^content-length:\s*(\d+)\s*$", head)
+    return bool(cl) and len(data) - m.end() >= int(cl.group(1))
+
+
+def http_get(ip, url, deadline=None):
+    """Plain HTTP/1.1 GET without following redirects. Returns (status, headers, body)."""
+    deadline = deadline or time.monotonic() + PROBE_BUDGET
+    u = urlsplit(url)
+    req = (f"GET {u.path or '/'} HTTP/1.1\r\nHost: {u.hostname}\r\n"
+           "User-Agent: CaptiveNetworkSupport/1.0 wispr\r\nAccept: */*\r\n"
+           "Connection: close\r\n\r\n").encode()
+    with bound_socket(socket.SOCK_STREAM) as s:
+        s.connect((ip, u.port or 80))
+        s.sendall(req)
+        data = b""
+        while len(data) < 65536 and not _complete(data):
+            left = min(TIMEOUT, deadline - time.monotonic())
+            try:
+                if left <= 0:
+                    raise TimeoutError("timed out")
+                s.settimeout(left)
+                chunk = s.recv(8192)
+            except TimeoutError:
+                if re.search(rb"\r?\n\r?\n", data):
+                    break  # have the head; server just didn't close
+                raise
+            if not chunk:
+                break
+            data += chunk
+    m = re.search(rb"\r?\n\r?\n", data)
+    head, body = (data[:m.start()], data[m.end():]) if m else (data, b"")
+    lines = re.split(r"\r?\n", head.decode("latin-1"))
+    m = re.match(r"HTTP/\d(?:\.\d)?\s+(\d{3})", lines[0])
+    if not m:
+        raise OSError("not an HTTP response")
+    headers = {}
+    for line in lines[1:]:
+        k, _, v = line.partition(":")
+        headers[k.strip().lower()] = v.strip()
+    return int(m.group(1)), headers, body
+
+
+def find_portal_url(url, status, headers, body):
+    """Where to log in. Comes from an untrusted network: only http(s) URLs."""
+    try:
+        found = _find_portal_url(url, status, headers, body)
+        u = urlsplit(found)
+        if u.scheme not in ("http", "https") or not u.hostname or len(found) > 2000:
+            return url
+        return found
+    except ValueError:  # e.g. "http://[x": Invalid IPv6 URL
+        return url
+
+
+def _find_portal_url(url, status, headers, body):
+    if 300 <= status < 400 and headers.get("location"):
+        return urljoin(url, headers["location"])
+    m = re.search(r"url\s*=\s*['\"]?([^'\";]+)", headers.get("refresh", ""), re.I)
+    if m:
+        return urljoin(url, m.group(1).strip())
+    text = body.decode("utf-8", "replace")
+    for tag in re.findall(r"<meta\b[^>]*>", text, re.I):
+        if re.search(r"""http-equiv\s*=\s*["']?refresh""", tag, re.I):
+            c = re.search(r"""content\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))""", tag, re.I)
+            v = c and next(g for g in c.groups() if g is not None)
+            m = v and re.search(r"""url\s*=\s*['"]?([^'"]+)""", v, re.I)
+            if m:
+                return urljoin(url, html.unescape(m.group(1).strip()))
+    m = re.search(r"""\blocation(?:\.href)?\s*=\s*["']([^"']+)["']"""
+                  r"""|\blocation\.(?:replace|assign)\(\s*["']([^"']+)["']""", text)
+    if m:
+        return urljoin(url, html.unescape(m.group(1) or m.group(2)))
+    # Portal served its page in place of the probe: opening the probe URL
+    # from a hotspot device will show it.
+    return url
+
+
+def probe(name, url, want_status, want_body, dns):
+    r = {"name": name, "url": url}
+    deadline = time.monotonic() + PROBE_BUDGET
+    try:
+        ips = resolve(urlsplit(url).hostname, dns, deadline)
+        for i, ip in enumerate(ips[:2]):
+            r["ip"] = ip
+            try:
+                status, headers, body = http_get(ip, url, deadline)
+                break
+            except OSError:
+                if i == len(ips[:2]) - 1 or time.monotonic() >= deadline:
+                    raise
+    except (OSError, ValueError) as e:
+        r.update(result="error", detail=str(e))
+        return r
+    r["status"] = status
+    if status == want_status and (want_body is None or want_body in body):
+        r["result"] = "ok"
+    else:
+        r.update(result="portal", portal_url=find_portal_url(url, status, headers, body))
+    return r
+
+
+def check():
+    connected, ssid, ip, dns = uplink_info()
+    out = {"checked_at": int(time.time()), "ssid": ssid, "uplink_ip": ip, "dns": dns,
+           "nm_connectivity": run("nmcli", "networking", "connectivity"),
+           "state": "offline", "portal_url": None, "probes": []}
+    if not connected or not ip:
+        out["detail"] = "uplink not connected"
+        return out
+    if not dns:
+        out["detail"] = "uplink has no DNS server"
+        return out
+    with ThreadPoolExecutor(len(PROBES)) as ex:
+        out["probes"] = list(ex.map(lambda p: probe(*p, dns), PROBES))
+    portals = [p for p in out["probes"] if p["result"] == "portal"]
+    ok = [p for p in out["probes"] if p["result"] == "ok"]
+    intercepted = bool(portals) and not ok
+    if portals and ok:
+        # Mixed answers: a portal whitelisting some probe hosts, or a filter
+        # blocking one? Ask a host nobody whitelists.
+        tb = probe(*TIEBREAK, dns)
+        out["probes"].append(tb)
+        if tb["result"] == "portal":
+            intercepted, portals = True, portals + [tb]
+        elif tb["result"] == "error":
+            intercepted = len(portals) >= len(ok)
+    if intercepted:
+        redirected = [p for p in portals if 300 <= p.get("status", 0) < 400]
+        out["state"] = "portal"
+        out["portal_url"] = (redirected or portals)[0]["portal_url"]
+    elif ok:
+        out["state"] = "online"
+    else:
+        out["detail"] = "no probe answered"
+    return out
+
+
+def main():
+    quiet = "--quiet" in sys.argv
+    os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
+    # NM fires several events at once; run checks one at a time.
+    lock = open(STATE_FILE + ".lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    result = check()
+    try:
+        with open(STATE_FILE) as f:
+            prev = json.load(f).get("state")
+    except (OSError, ValueError):
+        prev = None
+    tmp = f"{STATE_FILE}.{os.getpid()}.tmp"
+    with open(tmp, "w") as f:
+        json.dump(result, f, indent=1)
+    os.chmod(tmp, 0o644)
+    os.replace(tmp, STATE_FILE)
+    if result["state"] != prev:
+        msg = f"uplink state {prev} -> {result['state']}"
+        if result["portal_url"]:
+            msg += f" (login: {result['portal_url']})"
+        run("logger", "-t", "mariner-check", msg)
+    # Apply the Geph/portal interlock (pauses Geph while a portal is up) and
+    # self-heal routing and firewall state.
+    if os.path.exists("/usr/local/lib/mariner/bin/mariner-ctl"):
+        lock.close()
+        subprocess.run(["/usr/local/lib/mariner/bin/mariner-ctl", "reconcile"],
+                       capture_output=True, timeout=150)
+        # Where VPN traffic exits (rate-limited inside: every 30 s until
+        # confirmed, then every 5 min).
+        subprocess.run(["/usr/local/lib/mariner/bin/mariner-ctl", "vpn-probe"],
+                       capture_output=True, timeout=60)
+    if not quiet:
+        print(json.dumps(result, indent=1))
+
+
+if __name__ == "__main__":
+    main()

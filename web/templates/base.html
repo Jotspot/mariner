@@ -1,0 +1,40 @@
+{% from "icons.html" import icon with context %}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#f8f9ff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#101418" media="(prefers-color-scheme: dark)">
+{% block meta %}{% endblock %}
+<title>{% block title %}Mariner{% endblock %}</title>
+<link rel="stylesheet" href="/static/m3.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath fill='%2300639b' d='M17 15l1.55 1.55c-.96 1.69-3.33 3.04-5.55 3.37V11h3V9h-3V7.82C14.16 7.4 15 6.3 15 5c0-1.65-1.35-3-3-3S9 3.35 9 5c0 1.3.84 2.4 2 2.82V9H8v2h3v8.92c-2.22-.33-4.59-1.68-5.55-3.37L7 15l-4-3v3c0 3.88 4.92 7 9 7s9-3.12 9-7v-3l-4 3zM12 4c.55 0 1 .45 1 1s-.45 1-1 1-1-.45-1-1 .45-1 1-1z'/%3E%3C/svg%3E">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+{% block body %}
+<header class="top-bar">
+  <div class="brand">
+    <div class="logo">{{ icon("anchor") }}</div>
+    <h1 class="title-l">{% block heading %}Mariner{% endblock %}</h1>
+  </div>
+  {% block topaction %}{% endblock %}
+</header>
+<main>
+  {% if msg %}<div class="snackbar" role="status">{{ icon("check") }}<span>{{ msg }}</span></div>{% endif %}
+  {% if err %}<div class="snackbar error" role="alert">{{ icon("warning") }}<span>{{ err }}</span></div>{% endif %}
+  {% block content %}{% endblock %}
+</main>
+<nav class="nav-bar" aria-label="Main">
+  <div class="nav-brand">{{ icon("anchor") }}<span>Mariner</span></div>
+  {% for key, href, ic, label in [("home", "/", "home", "Home"), ("wifi", "/wifi", "wifi", "Wi-Fi"),
+                                  ("vpn", "/vpn", "shield", "VPN"), ("hotspot", "/hotspot", "tethering", "Hotspot"),
+                                  ("system", "/system", "settings", "System")] %}
+  <a href="{{ href }}" class="{{ 'active' if active == key }}"{% if active == key %} aria-current="page"{% endif %}>
+    <span class="pill">{{ icon(ic) }}</span>{{ label }}
+  </a>
+  {% endfor %}
+</nav>
+{% endblock %}
+</body>
+</html>

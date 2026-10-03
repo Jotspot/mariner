@@ -1,0 +1,10 @@
+[Unit]
+Description=Mariner: periodic captive portal check
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

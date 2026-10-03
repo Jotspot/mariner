@@ -1,0 +1,5 @@
+[Unit]
+Description=Mariner: hotspot traffic through Outline (Shadowsocks)
+# Started and stopped only by `mariner-ctl reconcile`; never enabled directly.
+Wants=outline-ss.service mariner-tun.service mariner-dns.service
+Conflicts=mariner-vpn-geph.target mariner-vpn-expressvpn.target

@@ -1,0 +1,80 @@
+#!/bin/bash
+# Keep the hotspot (uap0) running on the uplink's band.
+#
+# The onboard Broadcom radio runs one managed and one AP interface on a single
+# shared channel. Tested behaviour of its firmware:
+#   - AP started on a different channel of the SAME band: firmware moves the AP
+#     onto the uplink's channel, and drags it along when wlan0 roams.
+#   - AP started on the OTHER band: activation fails.
+# So we only need the hotspot profile's band to match the uplink; the channel
+# is set too, but only as a hint.
+#
+# Run by the NM dispatcher hook when wlan0 comes up and every 30 s by
+# mariner-hotspot-sync.timer (restarts the hotspot if it has dropped).
+set -uo pipefail
+exec 9>/run/lock/mariner-hotspot-sync.lock
+flock -n 9 || exit 0
+
+CON=mariner-hotspot
+STATE=/run/mariner/hotspot.json
+mkdir -p /run/mariner
+
+log() { logger -t mariner-hotspot "$*"; echo "$*"; }
+state() { printf '{"band":"%s","channel":%s,"status":"%s","note":"%s"}\n' "$1" "$2" "$3" "$4" > "$STATE"; }
+
+cur_band=$(nmcli -g 802-11-wireless.band con show "$CON")
+cur_chan=$(nmcli -g 802-11-wireless.channel con show "$CON")
+active=$(nmcli -g GENERAL.STATE con show "$CON" 2>/dev/null)
+
+freq=$(iw dev wlan0 link 2>/dev/null | awk '/freq:/ {print int($2)}')
+if [ -z "$freq" ]; then
+    # No uplink: just make sure the hotspot is up on its configured band.
+    if [ "$active" != activated ]; then
+        log "no uplink; starting hotspot on ${cur_band}/${cur_chan}"
+        nmcli con up "$CON" >/dev/null || log "hotspot failed to start"
+    fi
+    state "$cur_band" "${cur_chan:-0}" "$( [ "$(nmcli -g GENERAL.STATE con show "$CON" 2>/dev/null)" = activated ] && echo ok || echo error)" "No uplink"
+    exit 0
+fi
+
+if [ "$freq" -lt 3000 ]; then
+    band=bg
+    if [ "$freq" -eq 2484 ]; then chan=14; else chan=$(( (freq - 2407) / 5 )); fi
+else
+    band=a
+    chan=$(( (freq - 5000) / 5 ))
+fi
+
+if [ "$band" = a ] && [ "$chan" -ge 52 ] && [ "$chan" -le 144 ]; then
+    # DFS (radar) channels: an AP may not be started here.
+    if [ "$active" != activated ]; then
+        log "uplink is on DFS channel $chan; hotspot cannot run. Force the uplink to 2.4 GHz."
+    fi
+    state "$band" "$chan" dfs "Uplink is on a radar (DFS) channel; force 2.4 GHz on the uplink"
+    exit 0
+fi
+
+ap_freq=$(iw dev uap0 info 2>/dev/null | awk '/channel/ {gsub(/\(/, "", $3); print int($3)}')
+ap_band=
+[ -n "$ap_freq" ] && { [ "$ap_freq" -lt 3000 ] && ap_band=bg || ap_band=a; }
+
+if [ "$active" = activated ] && [ "$ap_band" = "$band" ]; then
+    # Running on the right band (the firmware may have moved it there itself).
+    # Record that in the profile without restarting, so a later restart or
+    # reboot comes up on the right band.
+    if [ "$cur_band" != "$band" ] || [ "$cur_chan" != "$chan" ]; then
+        nmcli con modify "$CON" 802-11-wireless.band "$band" 802-11-wireless.channel "$chan"
+    fi
+    state "$band" "$chan" ok ""
+    exit 0
+fi
+
+log "starting hotspot on band $band channel $chan (profile was ${cur_band:-?}/${cur_chan:-?}, $active)"
+nmcli con modify "$CON" 802-11-wireless.band "$band" 802-11-wireless.channel "$chan"
+if nmcli con up "$CON" >/dev/null; then
+    state "$band" "$chan" ok ""
+else
+    log "failed to start hotspot on $band/$chan"
+    state "$band" "$chan" error "Hotspot failed to start on channel $chan"
+    exit 1
+fi

@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% from "macros.html" import csrf_field with context %}
+{% block heading %}Hotspot{% endblock %}
+{% block content %}
+<div class="layout cols-2">
+  {% set online = devices|selectattr("connected")|list %}
+  <section class="card span-all" data-live="hs-devices">
+    <div class="card-head">
+      <div class="avatar">{{ icon("devices") }}</div>
+      <div class="grow"><p class="title-m">Devices</p>
+        <p class="body-m">{{ online|length }} connected{% if devices|length > online|length %} · {{ devices|length - online|length }} seen recently{% endif %}</p></div>
+      <a class="btn text" href="/hotspot">{{ icon("refresh") }}Refresh</a>
+    </div>
+    {% if not devices %}<p class="body-m">No devices yet.</p>{% endif %}
+    <ul class="list devices">
+    {% for d in devices %}
+      <li>
+        <details class="item-expand" data-key="dev-{{ d.mac }}">
+          <summary class="item">
+            <span class="dot {{ 'on' if d.connected }}" aria-hidden="true"></span>
+            <div class="grow">
+              <p class="label-l">{{ d.name or "Unnamed device" }}</p>
+              <p class="body-s mono">{{ d.ip or "no address" }}</p>
+              {% if d.connected %}<p class="body-s">{% if d.connected_secs is not none %}On for {{ d.connected_secs|duration }}{% endif %}{% if d.rx_bytes is not none %} · ↓ {{ d.rx_bytes|bytes }} · ↑ {{ d.tx_bytes|bytes }}{% endif %}</p>{% endif %}
+            </div>
+            <span class="chip {{ 'ok' if d.connected else '' }}">{{ "Connected" if d.connected else "Away" }}</span>
+          </summary>
+          <dl class="kv expand-body">
+            <dt>IP address</dt><dd class="mono">{{ d.ip or "–" }}</dd>
+            <dt>MAC address</dt><dd class="mono">{{ d.mac }}{% if d.private_mac %} <span class="body-s">(private)</span>{% endif %}</dd>
+            {% if d.signal_dbm is not none %}<dt>Signal</dt><dd>{{ d.signal_dbm }} dBm</dd>{% endif %}
+            {% if d.idle_ms is not none %}<dt>Last activity</dt><dd>{{ (d.idle_ms / 1000)|round|int }} s ago</dd>{% endif %}
+            {% if d.lease_expires %}<dt>Address lease</dt><dd>renews within {{ (d.lease_expires - now)|duration if now else "" }}</dd>{% endif %}
+          </dl>
+          {% if d.private_mac %}<p class="body-s expand-body">This device uses a private Wi-Fi address, so it may get a new one (and a new IP) after rejoining.</p>{% endif %}
+        </details>
+      </li>
+    {% endfor %}
+    </ul>
+  </section>
+
+  <section class="card" data-live="hs-status">
+    <div class="card-head">
+      <div class="avatar on">{{ icon("tethering") }}</div>
+      <div class="grow"><p class="title-m">{{ hs.ssid }}</p>
+        <p class="body-m">{{ {"a": "5 GHz", "bg": "2.4 GHz"}.get(hs.band, hs.band) }}{% if hs.channel %} · channel {{ hs.channel }}{% endif %} · {{ {"activated": "running", "activating": "starting", "deactivating": "stopping"}.get(hs.state, hs.state) }}</p></div>
+      <span class="chip">{{ icon("devices") }}{{ hs.clients }}</span>
+    </div>
+    {% if hs.sync and hs.sync.status == "dfs" %}
+    <p class="body-m">{{ icon("warning") }} {{ hs.sync.note }}. Open <a href="/wifi">Wi-Fi</a>, expand the network, and choose 2.4 GHz.</p>
+    {% endif %}
+  </section>
+
+  <form class="card" method="post" action="/hotspot" data-confirm="The hotspot restarts and every device disconnects for a moment. Continue?">
+    {{ csrf_field(csrf) }}
+    <label class="field"><span>Network name</span>
+      <input type="text" name="ssid" value="{{ hs.ssid }}" maxlength="32" required></label>
+    <label class="field"><span>New password</span>
+      <input type="password" name="password" minlength="8" maxlength="63" autocomplete="new-password">
+      <span class="support">Leave empty to keep the current password.</span></label>
+    <p class="body-s">Band when there's no upstream network</p>
+    <div class="segmented mt" role="radiogroup" aria-label="Band">
+      <label><input type="radio" name="band" value="bg" {{ "checked" if hs.band == "bg" }}><span>2.4 GHz</span></label>
+      <label><input type="radio" name="band" value="a" {{ "checked" if hs.band == "a" }}><span>5 GHz</span></label>
+    </div>
+    <p class="body-s mt">Mariner's single radio has to share one channel. Once it joins a network, the hotspot moves to that network's band and channel automatically.</p>
+    <div class="card-actions"><button class="btn filled" type="submit" data-busy="Saving…">Save</button></div>
+  </form>
+</div>
+{% endblock %}

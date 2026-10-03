@@ -1,0 +1,5 @@
+[Unit]
+Description=Mariner: hotspot traffic through ExpressVPN (sandboxed official app)
+# Started and stopped only by `mariner-ctl reconcile`; never enabled directly.
+Wants=mariner-evpn-netns.service expressvpn-service.service mariner-evpn-dns.service
+Conflicts=mariner-vpn-geph.target mariner-vpn-outline.target

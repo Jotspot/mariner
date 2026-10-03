@@ -1,0 +1,17 @@
+[Unit]
+Description=Outline client: shadowsocks-rust sslocal (SOCKS5 on 127.0.0.1:9909)
+PartOf=mariner-vpn-outline.target
+After=network-online.target
+
+[Service]
+# Config with the access key is root-only; systemd hands a copy to this
+# unprivileged dynamic user.
+DynamicUser=yes
+LoadCredential=outline.json:/etc/mariner/outline.json
+ExecStart=/usr/local/bin/sslocal --log-without-time -c ${CREDENTIALS_DIRECTORY}/outline.json
+Restart=always
+RestartSec=10
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes

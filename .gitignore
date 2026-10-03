@@ -1,0 +1,10 @@
+# Secrets live in /etc/mariner on the Pi, never in the repo.
+*.secret
+*.key
+*.pem
+geph.yaml
+portal.conf
+.env
+__pycache__/
+*.pyc
+.venv/

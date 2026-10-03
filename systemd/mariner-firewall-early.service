@@ -1,0 +1,17 @@
+[Unit]
+Description=Mariner: kill switch before networking starts (fail closed at boot)
+# At boot nothing else creates Mariner's firewall until mariner-reconcile runs
+# after NetworkManager. If the VPN was on with its kill switch, block hotspot
+# traffic from the very first moment instead.
+DefaultDependencies=no
+After=local-fs.target
+Before=network-pre.target NetworkManager.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/mariner/bin/mariner-ctl reconcile --no-units
+StandardOutput=null
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,9 @@
+[Unit]
+Description=Mariner: captive portal / connectivity check on the uplink
+After=NetworkManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/mariner/bin/mariner-check --quiet
+# The check itself takes seconds, but it also runs reconcile and the exit probe.
+TimeoutStartSec=300

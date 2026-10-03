@@ -1,0 +1,13 @@
+[Unit]
+Description=Mariner: hotspot DNS via DoH through the VPN
+PartOf=mariner-vpn-geph.target mariner-vpn-outline.target
+After=geph5.service outline-ss.service
+
+[Service]
+DynamicUser=yes
+ExecStart=/usr/bin/python3 /usr/local/lib/mariner/bin/mariner-dns
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes

@@ -1,0 +1,52 @@
+{% extends "base.html" %}
+{% from "macros.html" import uplink_chip, csrf_field with context %}
+{% block heading %}Login page{% endblock %}
+{% block content %}
+{% set up = st.uplink or {} %}{% set g = st.vpn or {} %}
+<div class="layout cols-2">
+  <section class="card {{ 'tertiary' if up.state == 'portal' }}" data-live="portal-status">
+    <div class="card-head">
+      <div class="avatar {{ 'warn' if up.state == 'portal' else ('on' if up.state == 'online' else 'bad') }}">{{ icon("web") }}</div>
+      <div class="grow"><p class="body-s">{{ up.ssid or "No network" }}</p>
+        <p class="title-m">{% if up.state == "portal" %}Login required{% elif up.state == "online" %}You're online{% else %}No internet{% endif %}</p></div>
+      {{ uplink_chip(up.state) }}
+    </div>
+    {% if up.state == "portal" %}
+      <p class="body-m">Open the network's login page on this device. When you're done, Mariner notices within a minute{% if g.enabled %} and turns {{ g.provider_name }} back on{% endif %}.</p>
+      {% if g.enabled and g.killswitch and not g.login_window_until %}
+      <p class="body-m mt"><b>The VPN kill switch is blocking direct traffic.</b> Allow direct access for 10 minutes so the login page can load.</p>
+      {% elif g.login_window_until %}
+      <p class="body-m mt">Direct access is allowed for the next few minutes.</p>
+      {% endif %}
+      <div class="card-actions">
+        {% if g.enabled and g.killswitch and not g.login_window_until %}
+        <form method="post" action="/portal/allow" class="inline">{{ csrf_field(csrf) }}
+          <button class="btn tonal" type="submit">Allow 10 min</button></form>
+        {% endif %}
+        <a class="btn filled" href="{{ up.portal_url }}" target="_blank" rel="noopener noreferrer">{{ icon("open") }}Open login page</a>
+      </div>
+      <p class="body-s mt mono">{{ up.portal_url }}</p>
+    {% elif up.state == "online" %}
+      <p class="body-m">No login page detected. If a site still asks you to log in, check again.</p>
+    {% else %}
+      <p class="body-m">{{ up.detail or "Mariner can't reach the internet through this network." }}</p>
+    {% endif %}
+    <div class="card-actions">
+      <form method="post" action="/portal/check" class="inline">{{ csrf_field(csrf) }}
+        <button class="btn outlined" type="submit" data-busy="Checking…">{{ icon("refresh") }}Check again</button></form>
+    </div>
+  </section>
+
+  {% if up.probes %}
+  <section class="card outlined" data-live="portal-probes">
+    <p class="title-m">Last check</p>
+    <ul class="list">
+      {% for p in up.probes %}
+      <li class="item"><div class="grow"><p class="label-l">{{ p.name|capitalize }}</p><p class="body-s mono">{{ p.url }}</p></div>
+        <span class="chip {{ {'ok': 'ok', 'portal': 'warn'}.get(p.result, 'bad') }}">{{ p.result }}{% if p.status %} · {{ p.status }}{% endif %}</span></li>
+      {% endfor %}
+    </ul>
+  </section>
+  {% endif %}
+</div>
+{% endblock %}

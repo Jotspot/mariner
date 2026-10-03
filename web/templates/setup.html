@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}Set up Mariner{% endblock %}
+{% block body %}
+<div class="center">
+  <form class="card" method="post" action="/setup" data-full>
+    <div class="logo-big">{{ icon("anchor") }}</div>
+    <h1 class="headline tc">Welcome aboard</h1>
+    <p class="body-m tc">Choose the password that protects this control panel. You'll need it on every new device.</p>
+    {% if err %}<div class="snackbar error" role="alert">{{ icon("warning") }}<span>{{ err }}</span></div>{% endif %}
+    <label class="field"><span>New password</span>
+      <input type="password" name="password" minlength="8" required autocomplete="new-password" autofocus></label>
+    <label class="field"><span>Confirm password</span>
+      <input type="password" name="confirm" minlength="8" required autocomplete="new-password"></label>
+    <button class="btn filled block" type="submit">Set password</button>
+  </form>
+</div>
+{% endblock %}

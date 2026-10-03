@@ -1,0 +1,301 @@
+#!/usr/bin/env python3
+"""DNS for hotspot clients while the VPN (Geph or Outline) is on.
+
+Listens on 10.42.0.1:5354 (UDP and TCP); nftables redirects every port-53
+query from the hotspot here while traffic goes through the VPN. Each query is
+sent as DNS-over-HTTPS through the VPN's SOCKS5 port, so lookups never touch the
+upstream (hotel) network and the VPN exit only sees TLS.
+
+  - mariner / mariner.local are answered locally with 10.42.0.1.
+  - Answers are cached by question until their smallest TTL expires.
+  - A few keep-alive HTTPS connections are pooled; Cloudflare first, Google
+    as fallback.
+
+Stdlib only (asyncio + ssl). Runs as an unprivileged dynamic user.
+"""
+import asyncio
+import ipaddress
+import logging
+import os
+import ssl
+import struct
+import time
+
+LISTEN = (os.environ.get("MARINER_DNS_ADDR", "10.42.0.1"), int(os.environ.get("MARINER_DNS_PORT", "5354")))
+SOCKS = ("127.0.0.1", 9909)
+UPSTREAMS = [
+    # (ip to connect to via SOCKS, TLS server name, path)
+    ("1.1.1.1", "cloudflare-dns.com", "/dns-query"),
+    ("8.8.8.8", "dns.google", "/dns-query"),
+]
+LOCAL_NAMES = {"mariner", "mariner.local"}
+LOCAL_IP = "10.42.0.1"
+POOL_SIZE = 4
+# "doh": DNS-over-HTTPS through the SOCKS port (Geph, Outline).
+# "resolv": plain DNS to the nameservers in MARINER_DNS_RESOLV (ExpressVPN:
+# runs inside its sandbox, where that file holds ExpressVPN's DNS server and
+# the sandbox firewall only lets this service send through the tunnel).
+UPSTREAM = os.environ.get("MARINER_DNS_UPSTREAM", "doh")
+RESOLV = os.environ.get("MARINER_DNS_RESOLV", "/etc/resolv.conf")
+TIMEOUT = 8.0
+
+log = logging.getLogger("mariner-dns")
+
+
+# --- DNS message helpers -------------------------------------------------------
+
+def parse_question(msg):
+    """Return (qname lowercase, qtype, offset after question) or None."""
+    if len(msg) < 12:
+        return None
+    off, labels = 12, []
+    while off < len(msg):
+        n = msg[off]
+        off += 1
+        if n == 0:
+            break
+        if n & 0xC0:
+            return None
+        labels.append(msg[off:off + n].decode("ascii", "replace").lower())
+        off += n
+    if off + 4 > len(msg):
+        return None
+    qtype, _ = struct.unpack(">HH", msg[off:off + 4])
+    return ".".join(labels), qtype, off + 4
+
+
+def local_answer(query, qtype, qend):
+    """Answer for one of our own names (A only; other types get an empty NOERROR)."""
+    qid = query[:2]
+    flags = 0x8180  # response, RD, RA, NOERROR
+    if qtype == 1:
+        rr = b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 60, 4) + ipaddress.IPv4Address(LOCAL_IP).packed
+        return qid + struct.pack(">HHHHH", flags, 1, 1, 0, 0) + query[12:qend] + rr
+    return qid + struct.pack(">HHHHH", flags, 1, 0, 0, 0) + query[12:qend]
+
+
+def min_ttl(msg):
+    """Smallest TTL among answer records (default 60, capped at 1 h)."""
+    try:
+        _, qd, an = struct.unpack(">HHH", msg[2:8])
+        off = 12
+
+        def skip(o):
+            while True:
+                n = msg[o]
+                if n == 0:
+                    return o + 1
+                if n & 0xC0 == 0xC0:
+                    return o + 2
+                o += 1 + n
+
+        for _ in range(qd):
+            off = skip(off) + 4
+        ttls = []
+        for _ in range(an):
+            off = skip(off)
+            _t, _c, ttl, rdlen = struct.unpack(">HHIH", msg[off:off + 10])
+            ttls.append(ttl)
+            off += 10 + rdlen
+        return max(5, min(min(ttls) if ttls else 60, 3600))
+    except (struct.error, IndexError):
+        return 30
+
+
+# --- DoH over SOCKS5 -------------------------------------------------------------
+
+class DohConn:
+    def __init__(self, upstream):
+        self.ip, self.host, self.path = upstream
+        self.reader = self.writer = None
+
+    async def connect(self):
+        r, w = await asyncio.open_connection(*SOCKS)
+        w.write(b"\x05\x01\x00")
+        await w.drain()
+        if await r.readexactly(2) != b"\x05\x00":
+            raise OSError("SOCKS auth refused")
+        w.write(b"\x05\x01\x00\x01" + ipaddress.IPv4Address(self.ip).packed + struct.pack(">H", 443))
+        await w.drain()
+        rep = await r.readexactly(4)
+        if rep[1] != 0:
+            raise OSError(f"SOCKS connect failed ({rep[1]})")
+        alen = {1: 4, 4: 16}.get(rep[3])
+        if alen is None:
+            alen = (await r.readexactly(1))[0]
+        await r.readexactly(alen + 2)
+        await w.start_tls(ssl.create_default_context(), server_hostname=self.host)
+        self.reader, self.writer = r, w
+
+    async def query(self, msg):
+        if self.writer is None:
+            await self.connect()
+        req = (f"POST {self.path} HTTP/1.1\r\nHost: {self.host}\r\n"
+               "Content-Type: application/dns-message\r\nAccept: application/dns-message\r\n"
+               f"Content-Length: {len(msg)}\r\n\r\n").encode() + msg
+        self.writer.write(req)
+        await self.writer.drain()
+        head = await self.reader.readuntil(b"\r\n\r\n")
+        lines = head.decode("latin-1").split("\r\n")
+        status = int(lines[0].split()[1])
+        headers = {k.strip().lower(): v.strip() for k, _, v in (l.partition(":") for l in lines[1:] if l)}
+        if "content-length" not in headers:
+            raise OSError("DoH reply without Content-Length")
+        body = await self.reader.readexactly(int(headers["content-length"]))
+        if headers.get("connection", "").lower() == "close":
+            self.close()
+        if status != 200:
+            raise OSError(f"DoH HTTP {status}")
+        return body
+
+    def close(self):
+        if self.writer:
+            self.writer.close()
+        self.reader = self.writer = None
+
+
+def resolv_servers():
+    servers = []
+    try:
+        with open(RESOLV) as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 2 and parts[0] == "nameserver":
+                    try:
+                        if ipaddress.ip_address(parts[1]).version == 4:
+                            servers.append(parts[1])
+                    except ValueError:
+                        pass
+    except OSError:
+        pass
+    return servers or ["1.1.1.1"]
+
+
+def plain_query(body):
+    """Plain DNS (UDP, TCP if truncated) to the resolv.conf nameservers. Blocking."""
+    import random
+    import socket
+    for server in resolv_servers():
+        qid = random.randint(0, 0xFFFF).to_bytes(2, "big")
+        msg = qid + body
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.settimeout(3)
+                s.sendto(msg, (server, 53))
+                ans, _ = s.recvfrom(4096)
+            if ans[:2] != qid:
+                continue
+            if ans[2] & 0x02:  # TC: retry over TCP
+                with socket.create_connection((server, 53), timeout=5) as t:
+                    t.sendall(struct.pack(">H", len(msg)) + msg)
+                    n = struct.unpack(">H", t.recv(2))[0]
+                    ans = b""
+                    while len(ans) < n:
+                        chunk = t.recv(n - len(ans))
+                        if not chunk:
+                            break
+                        ans += chunk
+            return ans
+        except OSError as e:
+            log.warning("DNS via %s failed: %s", server, e)
+    return None
+
+
+class Resolver:
+    def __init__(self):
+        self.pool = asyncio.Queue()
+        for i in range(POOL_SIZE):
+            self.pool.put_nowait([DohConn(UPSTREAMS[0])])
+        self.cache = {}
+
+    async def resolve(self, query):
+        q = parse_question(query)
+        if q is None:
+            return None
+        name, qtype, qend = q
+        if name in LOCAL_NAMES:
+            return local_answer(query, qtype, qend)
+        key = query[2:]  # everything but the id
+        hit = self.cache.get(key)
+        if hit and hit[0] > time.monotonic():
+            return query[:2] + hit[1][2:]
+        if UPSTREAM == "resolv":
+            ans = await asyncio.to_thread(plain_query, query[2:])
+            if ans is None:
+                return query[:2] + struct.pack(">H", 0x8182) + query[4:6] + b"\0\0\0\0\0\0" + query[12:qend]
+            if len(self.cache) > 5000:
+                self.cache.clear()
+            self.cache[key] = (time.monotonic() + min_ttl(ans), ans)
+            return query[:2] + ans[2:]
+        slot = await self.pool.get()
+        try:
+            for upstream in UPSTREAMS:
+                conn = slot[0]
+                if (conn.ip, conn.host, conn.path) != upstream:
+                    conn.close()
+                    conn = slot[0] = DohConn(upstream)
+                for attempt in range(2):  # retry once on a stale keep-alive connection
+                    try:
+                        ans = await asyncio.wait_for(conn.query(b"\0\0" + query[2:]), TIMEOUT)
+                        if len(self.cache) > 5000:
+                            self.cache.clear()
+                        self.cache[key] = (time.monotonic() + min_ttl(ans), ans)
+                        if upstream is not UPSTREAMS[0]:
+                            slot[0].close()
+                            slot[0] = DohConn(UPSTREAMS[0])
+                        return query[:2] + ans[2:]
+                    except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError, IndexError) as e:
+                        conn.close()
+                        log.warning("%s via %s failed: %s", name, upstream[1], e or type(e).__name__)
+            return query[:2] + struct.pack(">H", 0x8182) + query[4:6] + b"\0\0\0\0\0\0" + query[12:qend]  # SERVFAIL
+        finally:
+            self.pool.put_nowait(slot)
+
+
+class UdpServer(asyncio.DatagramProtocol):
+    def __init__(self, resolver):
+        self.resolver = resolver
+
+    def connection_made(self, transport):
+        self.transport = transport
+
+    def datagram_received(self, data, addr):
+        asyncio.ensure_future(self.answer(data, addr))
+
+    async def answer(self, data, addr):
+        ans = await self.resolver.resolve(data)
+        if ans:
+            self.transport.sendto(ans, addr)
+
+
+async def tcp_client(reader, writer, resolver):
+    try:
+        while True:
+            n = struct.unpack(">H", await reader.readexactly(2))[0]
+            ans = await resolver.resolve(await reader.readexactly(n))
+            if not ans:
+                break
+            writer.write(struct.pack(">H", len(ans)) + ans)
+            await writer.drain()
+    except (asyncio.IncompleteReadError, OSError):
+        pass
+    finally:
+        writer.close()
+
+
+async def main():
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    resolver = Resolver()
+    loop = asyncio.get_running_loop()
+    await loop.create_datagram_endpoint(lambda: UdpServer(resolver), local_addr=LISTEN)
+    server = await asyncio.start_server(lambda r, w: tcp_client(r, w, resolver), *LISTEN)
+    if UPSTREAM == "resolv":
+        log.info("listening on %s:%d, plain DNS to nameservers in %s", *LISTEN, RESOLV)
+    else:
+        log.info("listening on %s:%d, DoH via SOCKS %s:%d", *LISTEN, *SOCKS)
+    async with server:
+        await server.serve_forever()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
