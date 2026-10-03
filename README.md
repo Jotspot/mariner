@@ -143,29 +143,25 @@ The installer is idempotent: run it again to update Mariner or change options. P
 ### The big picture
 
 ```mermaid
-flowchart LR
+flowchart TB
     subgraph you["Your devices"]
-        P[📱 Phone]
-        L[💻 Laptop]
-        T[📺 TV / e-reader]
+        direction LR
+        P["📱 Phone"] ~~~ L["💻 Laptop"] ~~~ T["📺 TV / e-reader"]
     end
 
     subgraph pi["Mariner (Raspberry Pi)"]
-        AP["uap0 hotspot<br/>10.42.0.1"]
-        R{"policy routing<br/>table 100"}
-        KS["nftables<br/>kill switch"]
-        VPN["VPN client<br/>Geph · Outline · ExpressVPN"]
-        UP["wlan0 uplink"]
-        UI["control panel<br/>mariner.local"]
+        direction LR
+        AP["uap0 hotspot<br/>10.42.0.1"] --> R{"policy<br/>routing"} --> KS["kill switch<br/>(nftables)"] --> VPN["VPN client<br/>Geph · Outline · ExpressVPN"] --> UP["wlan0 uplink"]
+        AP -. manage .-> UI["control panel<br/>mariner.local"]
     end
 
-    H[(Hotel / café Wi-Fi)]
-    I((Internet))
+    subgraph out["Outside"]
+        direction LR
+        H[("Hotel / café Wi-Fi")] --> I(("Internet"))
+    end
 
-    P & L & T -->|Wi-Fi| AP
-    AP --> R --> KS --> VPN --> UP
-    UP --> H --> I
-    AP -. manage .-> UI
+    you -->|"join the hotspot"| pi
+    pi -->|"encrypted tunnel"| out
 ```
 
 The Pi's single Wi-Fi chip runs two interfaces at once: `wlan0` joins the hotel network and `uap0` is your private hotspot. Only traffic from the hotspot is routed into the VPN. The Pi's own traffic (the VPN's connection to its servers, captive-portal checks) goes out directly, which is what makes this work behind portals and blocks.
@@ -190,8 +186,11 @@ flowchart TB
     G --> WLAN["wlan0 → hotel Wi-Fi"]
     WG --> WLAN
 
-    D["Hotspot DNS :53"] -. nft DNAT .-> DNS1["mariner-dns → DoH via SOCKS<br/>(Geph / Outline)"]
-    D -. nft DNAT .-> DNS2["DNS forwarder in sandbox → ExpressVPN resolver"]
+    C -. "DNS (port 53)" .-> DNAT{"nft DNAT"}
+    subgraph dns["Hotspot DNS, never the hotel's resolver"]
+        DNAT -->|Geph / Outline| DNS1["mariner-dns<br/>DoH through the SOCKS port"]
+        DNAT -->|ExpressVPN| DNS2["forwarder in the sandbox<br/>→ ExpressVPN's resolver"]
+    end
 ```
 
 ExpressVPN's app expects to control the whole machine's routing and firewall. Mariner runs it inside its own **network namespace**, so it only controls a sandbox, and a guard inside that sandbox drops anything that doesn't leave through ExpressVPN's tunnel.
@@ -200,22 +199,29 @@ ExpressVPN's app expects to control the whole machine's routing and firewall. Ma
 
 ```mermaid
 stateDiagram-v2
+    direction TB
+    state "Off" as Off
+    state "Connecting" as Connecting
+    state "Protected" as Protected
+    state "Paused for login page" as Paused
+    state "Login window (10 min)" as Login
+
     [*] --> Off
     Off --> Connecting: VPN on
-    Connecting --> Protected: tunnel up, exit confirmed
-    Protected --> Connecting: tunnel lost (traffic blocked meanwhile)
-    Protected --> PausedForPortal: hotel login page detected
-    Connecting --> PausedForPortal: hotel login page detected
-    PausedForPortal --> LoginWindow: "Allow 10 min"
-    LoginWindow --> PausedForPortal: window expires
-    PausedForPortal --> Connecting: network online again
-    LoginWindow --> Connecting: logged in, network online
+    Connecting --> Protected: tunnel up
+    Protected --> Connecting: tunnel lost
+    Connecting --> Paused: login page seen
+    Protected --> Paused: login page seen
+    Paused --> Login: you tap Allow
+    Login --> Paused: time runs out
+    Paused --> Connecting: online again
+    Login --> Connecting: online again
     Protected --> Off: VPN off
-    note right of PausedForPortal
-        VPN stopped, kill switch still blocking:
-        devices can't leak while you log in
-    end note
 ```
+
+- **Tunnel lost:** while it reconnects, the kill switch blocks hotspot traffic instead of letting it out unprotected.
+- **Paused for login page:** the VPN stops, but the kill switch keeps blocking, so devices can't leak while the hotel page is up.
+- **Login window:** for 10 minutes, direct traffic is allowed so you can sign in to the hotel page. Mariner reconnects the VPN as soon as the network is online.
 
 `mariner-ctl reconcile` is the single place this logic lives. It runs at boot (before networking), every minute, after every network change and after every setting change, and it always applies the blocking rules **first**.
 
@@ -223,22 +229,23 @@ stateDiagram-v2
 
 ```mermaid
 sequenceDiagram
-    autonumber
     participant M as mariner-check (on the Pi)
     participant D as Hotel DNS
     participant W as Probe servers
-    M->>D: resolve 3 probe hosts (via wlan0 only)
-    par Apple, Google, Microsoft in parallel
-        M->>W: plain-HTTP GET (no redirects followed)
-        W-->>M: expected answer, redirect or login page
+    M->>D: Resolve the probe hosts (over wlan0 only)
+    D-->>M: Addresses
+    par Apple, Google and Microsoft at once
+        M->>W: Plain-HTTP GET (redirects not followed)
+        W-->>M: Expected answer, redirect or login page
     end
-    alt all expected
-        M->>M: online → VPN runs
-    else intercepted
-        M->>M: portal (+ login URL) → pause VPN, show banner
-    else mixed answers
-        M->>W: tie-break probe (detectportal.firefox.com)
-        Note over M,W: portals intercept it, single-site filters don't
+    alt All answers as expected
+        Note over M: Online: the VPN may run
+    else Answers intercepted
+        Note over M: Portal: pause the VPN, show the login link
+    else Answers disagree
+        M->>W: Tie-break probe (detectportal.firefox.com)
+        W-->>M: Answer
+        Note over M,W: A portal intercepts this too, a site filter doesn't
     end
 ```
 
