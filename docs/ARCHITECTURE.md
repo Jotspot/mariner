@@ -242,11 +242,16 @@ phone DNS :53 --nft dnat--> mariner-dns 10.42.0.1:5354 --DoH via SOCKS--> 1.1.1.
   drop`. It doesn't depend on geph5-client being alive.
 - **DNS.** Geph's SOCKS server supports UDP ASSOCIATE, but hotspot DNS doesn't
   rely on it. While traffic goes through Geph, nft redirects every port-53
-  query from the hotspot to `mariner-dns`, which answers `mariner` and
-  `mariner.local` itself and sends everything else as DNS-over-HTTPS through
-  the SOCKS port (Cloudflare, falling back to Google), with a TTL cache.
-  When Geph is off, dnsmasq uses the network's DNS as usual (needed for
-  captive portals).
+  query from the hotspot to `mariner-dns`, which answers the router's own
+  names (hostname, hostname.local) itself and sends everything else as
+  DNS-over-HTTPS through the SOCKS port (Cloudflare, falling back to Google),
+  with a TTL cache keyed on (name, type, class, DO bit). `mariner-dns` always
+  runs: while the kill switch blocks and no tunnel is up (VPN starting, or
+  paused for a captive portal) hotspot DNS still goes to it, and it keeps
+  answering the router's name and REFUSEs everything else at once (the SOCKS
+  port is closed). Hotspot DNS never reaches the hotel's resolver while the
+  kill switch is on. When the VPN is off, dnsmasq uses the network's DNS as
+  usual.
 - **State machine** (`mariner-ctl reconcile`; runs at boot via
   `mariner-reconcile.service`, after every `mariner-check`, after every
   setting change, and from `mariner-tun.service` ExecStopPost):
@@ -255,13 +260,18 @@ phone DNS :53 --nft dnat--> mariner-dns 10.42.0.1:5354 --DoH via SOCKS--> 1.1.1.
   |---|---|---|---|---|
   | Geph off | stopped | direct | – | network's |
   | On, uplink online/offline | running | table 100 | blocks direct | DoH via Geph |
-  | On, captive portal detected | **stopped** | table 100 (unreachable) | blocks direct | DoH (fails) |
-  | Portal + "Allow 10 min" | stopped | direct | lifted | network's |
+  | On, captive portal detected | **stopped** | table 100 (unreachable) | blocks direct | router's name only; rest REFUSED |
+  | Login window open | as above | that device: direct (ip rule 900+) | that device exempt | that device: network's |
   | On, kill switch off, tunnel down | – | direct | – | network's |
 
-  The "Allow 10 min" window (`/run/mariner/portal-login-until`) lets a phone
-  load the hotel's login page; a transient timer reconciles again when it
-  expires.
+  The login window (`/run/mariner/portal-login.json`: until, device IPs, the
+  state it was opened in) lets **only the device that asked** load the hotel's
+  login page: an `ip rule` at priority 900+ sends that one address to the main
+  table, an `ip saddr … accept` comes before the kill-switch drop, and its DNS
+  skips the DNAT. Everyone else stays blocked. It works in any detected state
+  (a portal can let the probe hosts through), and closes when it expires, when
+  a detected portal turns "online", or when the VPN tunnel comes up. While it
+  is open, a `mariner-login-watch` unit runs `mariner-check` every 10 s.
 
 ## Web portal (phase 5)
 
@@ -312,7 +322,7 @@ phone DNS :53 --nft dnat--> mariner-dns 10.42.0.1:5354 --DoH via SOCKS--> 1.1.1.
 Run on the Pi, as root:
 
 - `tests/hotspot-client.sh up|run CMD|down`: a fake phone (netns
-  `mclient`, 10.42.0.250) on a veth that mariner-ctl treats like `uap0`.
+  `mclient`, 10.42.0.9) on a veth that mariner-ctl treats like `uap0`.
 - `tests/fake-portal.sh on [redirect|meta]|off`: makes the uplink look like
   a captive portal to `mariner-check`.
 - `tests/outline-selftest.sh`: Outline key parsing, config generation and
@@ -345,6 +355,15 @@ sudo arm-rollback cancel
 
 1. Survey and base setup: done.
 2. Uplink and hotspot: done, phone-tested.
-3. Captive portal detection: done (simulated portals; needs a real one).
+3. Captive portal detection: done. Tested offline against 108 simulated
+   networks (`tests/portal-sim`), and end to end on real Wi-Fi software:
+   `tests/containers/e2e-portal.sh` runs a hotel access point (hostapd on a
+   simulated radio, dnsmasq, a click-through portal redirecting port 80 until
+   "Accept") and a Mariner joining it with the VPN and kill switch on. Result
+   (2026-10-04): portal detected from the redirect within one check, VPN
+   paused, a hotspot device blocked; after "Allow this device" that device
+   alone reached the portal and logged in; Mariner saw the network online
+   about 40 s later, closed the window and resumed the VPN. Not yet tried
+   against a commercial portal (openNDS, hotel systems) on real hardware.
 4. VPN: Geph, Outline and ExpressVPN, all tested with real accounts (ExpressVPN: leak, DNS and kill switch tests on 2026-10-03).
 5. Web portal: done (phone and desktop layouts). Password is set on first visit.

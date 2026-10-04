@@ -160,11 +160,18 @@
     ev.preventDefault();
 
     var submitter = ev.submitter;
+    // Optimistic switch: flip it now, pulse until the router confirms. Only a
+    // switch that belongs to this form (a switch inside another form's markup
+    // can be attached to a different form with form="...").
+    var sw = submitter && submitter.classList.contains("switch") ? submitter : null;
+    if (!sw) {
+      var cand = form.querySelector(".switch");
+      if (cand && cand.form === form) sw = cand;
+    }
+    if (sw && sw.classList.contains("pending")) return;  // still waiting for the last tap
     var data = new FormData(form);
     if (submitter && submitter.name) data.append(submitter.name, submitter.value);
 
-    // Optimistic switch: flip it now, pulse until the router confirms.
-    var sw = form.querySelector(".switch") || (submitter && submitter.classList.contains("switch") ? submitter : null);
     if (sw) {
       sw.classList.toggle("on");
       sw.setAttribute("aria-checked", sw.classList.contains("on") ? "true" : "false");
@@ -198,6 +205,9 @@
           var doc = parse(res.html);
           document.title = doc.title;
           document.body.replaceWith(document.adoptNode(doc.body));
+          var refresh = doc.querySelector('meta[http-equiv="refresh"]');
+          var m = refresh && /^(\d+)\s*;\s*url=(\S+)$/i.exec(refresh.getAttribute("content") || "");
+          if (m) setTimeout(function () { location.href = m[2]; }, Number(m[1]) * 1000);
           return;
         }
         var j = res.json;

@@ -37,6 +37,23 @@
 
 {% macro csrf_field(csrf) -%}<input type="hidden" name="csrf" value="{{ csrf }}">{%- endmacro %}
 
+{% macro suspect_banner(v, csrf) -%}
+<div class="card tertiary banner">
+  {{ icon("web") }}
+  <div class="grow">
+    <p class="title-m">{{ v.provider_name }} can't connect</p>
+    <p class="body-m">The network looks fine, but the VPN hasn't connected for a few minutes. If this network has a login page, let this device through for 10 minutes and open it.</p>
+    <div class="card-actions">
+      <a class="btn outlined" href="/portal">Details</a>
+      {% if v.enabled and v.killswitch %}
+      <form method="post" action="/portal/allow" class="inline">{{ csrf_field(csrf) }}
+        <button class="btn filled" type="submit">Allow this device 10 min</button></form>
+      {% endif %}
+    </div>
+  </div>
+</div>
+{%- endmacro %}
+
 {% macro portal_banner(up, csrf) -%}
 {% if up and up.state == "portal" %}
 <div class="card tertiary banner">

@@ -18,6 +18,9 @@ RestartSec=3
 # (NoNewPrivileges, ProtectSystem, CapabilityBoundingSet) can't be used: it
 # would also apply to mariner-ctl. Keep what doesn't interfere.
 PrivateTmp=yes
+# /var/lib/mariner-web (owned by mariner): signed-out sessions.
+StateDirectory=mariner-web
+StateDirectoryMode=0700
 ProtectHome=yes
 
 [Install]

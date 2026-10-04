@@ -5,9 +5,11 @@ Requires=mariner-evpn-netns.service
 After=mariner-evpn-netns.service expressvpn-service.service
 
 [Service]
-# Fixed user: the sandbox's guard table only lets user "mariner" send through
-# the tunnel, so DNS can't leak if ExpressVPN disconnects.
-User=mariner
+# Its own fixed user: the sandbox's guard table only lets "mariner-dns" send
+# through the tunnel, so DNS can't leak if ExpressVPN disconnects. Not the
+# web panel's user: this parses untrusted DNS packets and must not be able to
+# read /etc/mariner/portal.json (session signing key).
+User=mariner-dns
 NetworkNamespacePath=/run/netns/evpn
 Environment=MARINER_DNS_ADDR=10.200.0.2 MARINER_DNS_UPSTREAM=resolv MARINER_DNS_RESOLV=/etc/netns/evpn/resolv.conf
 ExecStart=/usr/bin/python3 /usr/local/lib/mariner/bin/mariner-dns

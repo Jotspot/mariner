@@ -3,15 +3,25 @@
 # mariner-restore. Prints the snapshot directory on stdout.
 set -euo pipefail
 
-SNAP=/var/lib/mariner/snap-$(date +%Y%m%d-%H%M%S)
-mkdir -p "$SNAP"
+install -d -m 0755 /var/lib/mariner
+SNAP=$(mktemp -d "/var/lib/mariner/snap-$(date +%Y%m%d-%H%M%S)-XXXX")  # unique, even twice a second
+
 chmod 700 "$SNAP"
 
-cp -a /etc/NetworkManager/system-connections "$SNAP/nm-connections"
-cp -a /etc/netplan "$SNAP/netplan"
-[ -d /etc/NetworkManager/dnsmasq-shared.d ] && cp -a /etc/NetworkManager/dnsmasq-shared.d "$SNAP/dnsmasq-shared.d"
+# NetworkManager keyfiles, plus netplan where NM uses it as its backend
+# (Debian with cloud-init; Raspberry Pi OS and plain Debian have no netplan).
+if [ -d /etc/NetworkManager/system-connections ]; then
+    cp -a /etc/NetworkManager/system-connections "$SNAP/nm-connections"
+else
+    mkdir -m 700 "$SNAP/nm-connections"
+fi
+if [ -d /etc/netplan ]; then
+    cp -a /etc/netplan "$SNAP/netplan"
+fi
+if [ -d /etc/NetworkManager/dnsmasq-shared.d ]; then
+    cp -a /etc/NetworkManager/dnsmasq-shared.d "$SNAP/dnsmasq-shared.d"
+fi
 nft list ruleset > "$SNAP/nft.rules"
-ip rule save > "$SNAP/ip-rules.bin"
 ip -br link > "$SNAP/links.txt"
 
 # Keep the 10 newest snapshots (they contain Wi-Fi passwords).

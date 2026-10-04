@@ -151,7 +151,18 @@
   <h2 class="title-m section-title">ExpressVPN account</h2>
   <section class="card">
     {% if not e.installed %}
-      <p class="body-m">The ExpressVPN app isn't installed on this Mariner. See the README (ExpressVPN section).</p>
+      <p class="body-m">The ExpressVPN app isn't installed on this Mariner yet. It's added from a computer, not from this panel:</p>
+      <ol class="steps body-m">
+        <li>Sign in at expressvpn.com, open the <b>setup</b> page, choose <b>Linux</b> and download the installer
+          (<span class="mono">expressvpn-linux-universal-…_release.run</span>, one file for every kind of computer). Keep the activation code it shows.</li>
+        <li>Copy it to Mariner over SSH (connect your computer by ethernet or to this hotspot):
+          <code class="cmd">scp expressvpn-linux-universal-*.run {{ ssh_user }}@{{ hostname }}.local:</code></li>
+        <li>Add it, on Mariner:
+          <code class="cmd">ssh {{ ssh_user }}@{{ hostname }}.local</code>
+          <code class="cmd">curl -fsSL https://raw.githubusercontent.com/Jotspot/mariner/main/bootstrap.sh | sudo bash -s -- --add-expressvpn expressvpn-linux-universal-*.run</code></li>
+        <li>Come back here, choose ExpressVPN and sign in with the activation code.</li>
+      </ol>
+      <p class="body-s mt">Nothing else changes. Details: <a href="https://github.com/Jotspot/mariner#expressvpn" target="_blank" rel="noopener noreferrer">ExpressVPN in the README</a>.</p>
     {% elif e.signed_in %}
       <div class="card-head top">
         <div class="avatar">{{ icon("key") }}</div>

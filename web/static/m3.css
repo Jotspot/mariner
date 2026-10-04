@@ -100,6 +100,10 @@ svg.icon { width: 24px; height: 24px; fill: currentColor; flex: none; }
 .body-m { font-size: 14px; line-height: 20px; color: var(--md-on-surface-variant); }
 .body-s { font-size: 12px; line-height: 16px; color: var(--md-on-surface-variant); }
 .mono { font-family: ui-monospace, "Roboto Mono", Menlo, Consolas, monospace; overflow-wrap: anywhere; }
+.steps { margin: 12px 0 0; padding-left: 22px; }
+.steps li + li { margin-top: 10px; }
+code.cmd { display: block; margin-top: 6px; padding: 8px 12px; border-radius: 8px; background: var(--md-surface-container-highest, rgba(0,0,0,.06));
+  font: 13px/1.5 ui-monospace, "Roboto Mono", Menlo, Consolas, monospace; overflow-wrap: anywhere; user-select: all; }
 
 /* Top app bar */
 .top-bar {

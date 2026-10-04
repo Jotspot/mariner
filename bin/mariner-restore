@@ -15,20 +15,26 @@ for dev in uap0 vpn0 geph0; do
     fi
 done
 
+install -d -m 0700 /etc/NetworkManager/system-connections
 rsync -a --delete "$SNAP/nm-connections/" /etc/NetworkManager/system-connections/
-rsync -a --delete "$SNAP/netplan/" /etc/netplan/
+# netplan only where the snapshot had it (NM's netplan backend).
+if [ -d "$SNAP/netplan" ]; then
+    rsync -a --delete "$SNAP/netplan/" /etc/netplan/
+fi
 if [ -d "$SNAP/dnsmasq-shared.d" ]; then
     rsync -a --delete "$SNAP/dnsmasq-shared.d/" /etc/NetworkManager/dnsmasq-shared.d/
 else
     rm -rf /etc/NetworkManager/dnsmasq-shared.d
 fi
-netplan generate
+if [ -d "$SNAP/netplan" ] && command -v netplan >/dev/null; then
+    netplan generate
+fi
 
 nft flush ruleset
 nft -f "$SNAP/nft.rules"
 # Only Mariner's own policy rules: flushing and restoring everything would
 # duplicate the kernel's built-in rules.
-for prio in 900 $(seq 1000 1009); do
+for prio in $(seq 900 909) $(seq 1000 1009); do
     while ip rule del priority "$prio" 2>/dev/null; do :; done
 done
 

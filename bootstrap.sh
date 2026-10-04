@@ -26,12 +26,15 @@ GEPH=build                  # build | skip | binary
 GEPH_BINARY=""
 GEPH_VERSION=0.4.2          # tested with Mariner
 OUTLINE=yes
-EXPRESSVPN_INSTALLER=""
+EXPRESSVPN_INSTALLER=""     # path or https:// URL of ExpressVPN's Linux .run installer
+ADD_EVPN=no                 # --add-expressvpn: only add ExpressVPN to an installed Mariner
 MINIMAL_FIRMWARE=yes
 DISABLE_CLOUD_INIT=yes
 UPGRADE=no
 HOTSPOT=auto                # auto | yes | no
 ASSUME_YES=no
+INSTALL_CONF=/etc/mariner/install.conf   # choices that later runs (and install.sh) keep
+CLOUD_SET=no
 DRY_RUN=no
 WIZARD=auto                 # auto | no
 # Which settings came from options (the wizard doesn't ask about those). The
@@ -50,10 +53,14 @@ with --yes nothing is asked and defaults fill in the rest.
 
 Hotspot and system
   --ssid NAME               Hotspot name (default: Mariner)
-  --hotspot-password PW     Hotspot password, 8-63 chars (default: random, shown at the end)
+  --hotspot-password PW     Hotspot password, 8-63 chars (default: random, shown before
+                            installing). Visible to local users while the installer runs;
+                            --hotspot-password-file or the interactive prompt avoid that
+  --hotspot-password-file F Read the hotspot password from file F
   --country CC              Wi-Fi regulatory country, e.g. US, GB, SG (default: leave as is)
   --hostname NAME           Hostname, also NAME.local (default: mariner)
   --no-hotspot              Don't create the hotspot (e.g. no Wi-Fi, or set it up later)
+  --hotspot                 Create the hotspot after an earlier --no-hotspot (remembered)
   --keep-cloud-init         Don't disable cloud-init (it can reset hostname/network on boot)
   --standard-firmware       Keep the Pi's default Wi-Fi firmware (Mariner switches the
                             BCM43455 to Cypress' "minimal" build, more stable as a hotspot)
@@ -64,8 +71,11 @@ VPN providers
   --geph-binary PATH        Use an existing geph5-client binary instead of compiling
   --geph-version V          geph5-client version to compile (default: 0.4.2)
   --no-outline              Don't install the Outline (Shadowsocks) client
-  --expressvpn-installer F  Also install ExpressVPN from its official Linux .run installer
-                            (download it from your ExpressVPN account first)
+  --expressvpn-installer F  Also install ExpressVPN from its official Linux installer:
+                            a path to the .run file or an https:// link (see the
+                            README's ExpressVPN section for where to get it)
+  --add-expressvpn F        Add ExpressVPN to an already installed Mariner (same F).
+                            Runs only that step: nothing else is changed
 
 Install source
   --repo URL                Git repository (default: the official one)
@@ -129,18 +139,21 @@ run() {  # run a command, or just print it in --dry-run mode
 }
 task() {  # task "Label" cmd...: output to the log, a spinner meanwhile, ✓ or ✗ after
     local label=$1; shift
-    if [ "$DRY_RUN" = yes ]; then printf '    %s %swould run:%s %s\n' "$label" "$D" "$R" "$*"; return; fi
-    echo "+ $*" >>"$LOG"
+    if [ "$DRY_RUN" = yes ]; then printf '    %s %swould run:%s %s\n' "$label" "$D" "$R" "$(redact "$*")"; return; fi
+    echo "+ $(redact "$*")" >>"$LOG"
     local start=$SECONDS rc=0 i=0
     if [ "$FANCY" = yes ]; then
         "$@" >>"$LOG" 2>&1 </dev/null &
         local pid=$!
+        # Background jobs ignore SIGINT in scripts: stop the step on Ctrl-C.
+        trap 'kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; printf "\n"; exit 130' INT TERM
         while kill -0 "$pid" 2>/dev/null; do
             printf '\r    %s%s%s %s %s%s%s\033[K' "$CYAN" "${SPIN[i % ${#SPIN[@]}]}" "$R" "$label" "$D" "$(elapsed $start)" "$R"
             i=$((i + 1))
             sleep 0.2
         done
         wait "$pid" || rc=$?
+        trap - INT TERM
         printf '\r\033[K'
     else
         "$@" >>"$LOG" 2>&1 </dev/null || rc=$?
@@ -149,11 +162,16 @@ task() {  # task "Label" cmd...: output to the log, a spinner meanwhile, ✓ or 
         printf '    %s %s %s%s%s\n' "$OK" "$label" "$D" "$(elapsed $start)" "$R"
     else
         printf '    %s %s\n' "$BAD" "$label"
-        tail -n 12 "$LOG" | sed "s/^/      $D/; s/\$/$R/"
+        tail -n 12 "$LOG" | while IFS= read -r line; do printf '      %s%s%s\n' "$D" "$(redact "$line")" "$R"; done
         die "'$label' failed; the full log is in $LOG"
     fi
 }
 done_line() { printf '    %s %s\n' "$OK" "$*"; }
+redact() {  # the hotspot password never goes into the log, or onto the screen inside a command
+    local t=$1
+    [ -z "${HOTSPOT_PASSWORD:-}" ] || t=${t//"$HOTSPOT_PASSWORD"/[redacted]}
+    printf '%s' "$t"
+}
 skip_line() { printf '    %s- %s%s\n' "$D" "$*" "$R"; }
 
 TTY=no
@@ -197,10 +215,14 @@ while [ $# -gt 0 ]; do
     case "$1" in
         --ssid) need_arg "$@"; HOTSPOT_SSID=$2; SSID_SET=yes; shift ;;
         --hotspot-password) need_arg "$@"; HOTSPOT_PASSWORD=$2; PW_SET=yes; shift ;;
+        --hotspot-password-file) need_arg "$@"
+            [ -r "$2" ] || die "--hotspot-password-file: can't read $2"
+            HOTSPOT_PASSWORD=$(head -n 1 "$2" | tr -d '\r\n'); PW_SET=yes; shift ;;
         --country) need_arg "$@"; COUNTRY=${2^^}; COUNTRY_SET=yes; shift ;;
         --hostname) need_arg "$@"; HOSTNAME_NEW=$2; HOSTNAME_SET=yes; shift ;;
         --no-hotspot) HOTSPOT=no ;;
-        --keep-cloud-init) DISABLE_CLOUD_INIT=no ;;
+        --hotspot) HOTSPOT=yes ;;
+        --keep-cloud-init) DISABLE_CLOUD_INIT=no; CLOUD_SET=yes ;;
         --standard-firmware) MINIMAL_FIRMWARE=no; FW_SET=yes ;;
         --upgrade) UPGRADE=yes; UPGRADE_SET=yes ;;
         --no-geph) GEPH=skip; GEPH_SET=yes ;;
@@ -208,6 +230,7 @@ while [ $# -gt 0 ]; do
         --geph-version) need_arg "$@"; GEPH_VERSION=$2; shift ;;
         --no-outline) OUTLINE=no; OUTLINE_SET=yes ;;
         --expressvpn-installer) need_arg "$@"; EXPRESSVPN_INSTALLER=$2; EVPN_SET=yes; shift ;;
+        --add-expressvpn) need_arg "$@"; EXPRESSVPN_INSTALLER=$2; EVPN_SET=yes; ADD_EVPN=yes; shift ;;
         --repo) need_arg "$@"; REPO=$2; shift ;;
         --branch) need_arg "$@"; BRANCH=$2; shift ;;
         -y|--yes) ASSUME_YES=yes ;;
@@ -221,23 +244,135 @@ done
 
 # --- validation -------------------------------------------------------------------
 valid_ssid() { [ -n "$1" ] && [ "$(printf %s "$1" | wc -c)" -le 32 ]; }
-valid_pw() { [ ${#1} -ge 8 ] && [ ${#1} -le 63 ]; }
+valid_pw() {  # 8-63 printable ASCII characters, or 64 hex digits
+    local LC_ALL=C
+    [[ "$1" =~ ^[0-9A-Fa-f]{64}$ ]] && return 0
+    [ ${#1} -ge 8 ] && [ ${#1} -le 63 ] && [[ "$1" =~ ^[\ -~]+$ ]]
+}
 valid_country() { [[ "$1" =~ ^[A-Z]{2}$ ]]; }
 valid_hostname() { [[ "$1" =~ ^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$ ]]; }
 valid_ssid "$HOTSPOT_SSID" || die "--ssid must be 1-32 bytes"
-[ -z "$HOTSPOT_PASSWORD" ] || valid_pw "$HOTSPOT_PASSWORD" || die "--hotspot-password must be 8-63 characters"
+[ -z "$HOTSPOT_PASSWORD" ] || valid_pw "$HOTSPOT_PASSWORD" || die "--hotspot-password must be 8-63 plain ASCII characters (or 64 hex digits)"
 [ -z "$COUNTRY" ] || valid_country "$COUNTRY" || die "--country must be a two-letter code"
 valid_hostname "$HOSTNAME_NEW" || die "--hostname must be a valid lowercase hostname"
 [[ "$GEPH_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--geph-version must look like 0.4.2"
 [ "$GEPH" != binary ] || [ -x "$GEPH_BINARY" ] || die "--geph-binary: $GEPH_BINARY is not an executable file"
-[ -z "$EXPRESSVPN_INSTALLER" ] || [ -f "$EXPRESSVPN_INSTALLER" ] || die "--expressvpn-installer: $EXPRESSVPN_INSTALLER not found"
+if [ "$ADD_EVPN" = yes ]; then WIZARD=no; fi
 if [ "$WIZARD" = auto ]; then
     if [ "$ASSUME_YES" = no ] && [ "$DRY_RUN" = no ] && [ "$TTY" = yes ]; then WIZARD=yes; else WIZARD=no; fi
 fi
 
+EVPN_DOCS="https://github.com/Jotspot/mariner#expressvpn"
+EVPN_CACHE=/var/cache/mariner/expressvpn
+EVPN_ERR=""
+evpn_check() {
+    # Make $1 (a path or https:// URL) a verified local copy of ExpressVPN's
+    # Linux installer in EXPRESSVPN_INSTALLER, or explain in EVPN_ERR why not.
+    local src=$1 f hdr arch
+    EVPN_ERR=""
+    case "$src" in
+        https://*)
+            if [ "$DRY_RUN" = yes ]; then EXPRESSVPN_INSTALLER=$src; return 0; fi
+            install -d -m 0700 "$EVPN_CACHE"
+            f="$EVPN_CACHE/$(basename "${src%%\?*}")"
+            [[ "$f" == *.run ]] || f="$EVPN_CACHE/expressvpn-installer.run"
+            if ! curl -fsSL --proto '=https' --max-filesize 300000000 -o "$f.part" "$src" 2>/dev/null; then
+                rm -f "$f.part"
+                EVPN_ERR="couldn't download $src"
+                return 1
+            fi
+            mv "$f.part" "$f" ;;
+        http://*|ftp://*)
+            EVPN_ERR="only https:// links, please"
+            return 1 ;;
+        "~/"*)  # the admin's home, not root's
+            f="$(getent passwd "${SUDO_USER:-root}" | cut -d: -f6)/${src#\~/}" ;;
+        *)
+            f=$src ;;
+    esac
+    if [ ! -f "$f" ] || [ ! -r "$f" ]; then
+        EVPN_ERR="$f not found"
+        return 1
+    fi
+    # The .run file is a self-extracting (Makeself) shell script; its plain
+    # header carries the label "ExpressVPN" and the script it runs. The
+    # "universal" installer holds builds for several CPUs and picks the right
+    # one itself (multi_arch_installer.sh).
+    hdr=$(head -c 65536 "$f" | tr -d '\0')
+    if [[ "${hdr:0:2}" != '#!' ]] || [[ "$hdr" != *'label="ExpressVPN"'* ]]; then
+        EVPN_ERR="$f isn't ExpressVPN's Linux installer (expected expressvpn-linux-universal-<version>_release.run)"
+        return 1
+    fi
+    arch=""
+    if [[ "$hdr" =~ buildArchitecture=\"([a-z0-9_]+)\" ]]; then arch=${BASH_REMATCH[1]}; fi
+    if [[ "$hdr" != *'script="./multi_arch_installer.sh"'* ]]; then
+        case "$arch" in  # a single-CPU build: it must be the right one
+            arm64|aarch64) ;;
+            "") warn "couldn't tell which CPUs $f supports; trying it anyway" ;;
+            *)  EVPN_ERR="$f is ExpressVPN's installer for $arch computers only; download the Linux \"universal\" installer from your ExpressVPN account instead"
+                return 1 ;;
+        esac
+    fi
+    EXPRESSVPN_INSTALLER=$f
+}
+install_evpn() {
+    # Mariner's drop-in confines the daemon to its sandbox; it must be in
+    # place before ExpressVPN's installer starts the daemon.
+    run install -D -m 0644 "$DIR/systemd/expressvpn-service.service.d/mariner.conf" \
+        /etc/systemd/system/expressvpn-service.service.d/mariner.conf
+    run systemctl daemon-reload
+    # The installer refuses to run under sudo.
+    # Its own dependencies (present on Raspberry Pi OS, not on minimal Debian).
+    task "Installing ExpressVPN's dependencies" env DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        --no-install-recommends procps psmisc libatomic1 libglib2.0-0 libbrotli1
+    # It unpacks ~450 MB: on disk, not in /tmp (often a small RAM disk).
+    run install -d -m 0700 /var/cache/mariner/evpn-unpack
+    task "Running ExpressVPN's installer (headless)" env -u SUDO_USER -u SUDO_UID -u SUDO_GID -u SUDO_COMMAND \
+        TMPDIR=/var/cache/mariner/evpn-unpack sh "$EXPRESSVPN_INSTALLER" -- --no-gui
+    run rm -rf /var/cache/mariner/evpn-unpack
+    run systemctl disable --quiet expressvpn-service.service
+    run systemctl stop expressvpn-service.service
+    # Re-run Mariner's own installer to finish the sandbox. Only what was
+    # already chosen: no hotspot changes, Outline only if it's already there.
+    local outline=no
+    [ -x /usr/local/bin/sslocal ] && outline=yes
+    local hotspot=${PREV_HOTSPOT:-auto}
+    [ "$HOTSPOT" = auto ] || hotspot=$HOTSPOT
+    task "Sandboxing it" env -u MARINER_HOTSPOT_SSID -u MARINER_HOTSPOT_PASSWORD MARINER_HOTSPOT="$hotspot" \
+        MARINER_OUTLINE="$outline" GEPH_SRC=/nonexistent "$DIR/install.sh"
+}
+evpn_help() {
+    local who=${SUDO_USER:-pi} host
+    host=$(hostname -s 2>/dev/null || echo raspberrypi)
+    printf '    %sExpressVPN runs as its official Linux app, sandboxed by Mariner. To add it:%s\n' "$D" "$R"
+    printf '    %s 1. Sign in at expressvpn.com, open the setup page, choose Linux and download%s\n' "$D" "$R"
+    printf '    %s    the installer (expressvpn-linux-universal-<version>_release.run: one file%s\n' "$D" "$R"
+    printf '    %s    for every CPU). Note the activation code shown there.%s\n' "$D" "$R"
+    printf '    %s 2. Copy it to this Pi, e.g. from your computer:%s\n' "$D" "$R"
+    printf '    %s      scp expressvpn-linux-universal-*.run %s@%s.local:%s\n' "$D" "$who" "$host" "$R"
+    printf '    %s 3. Give its path (or an https:// link) here. You enter the activation code%s\n' "$D" "$R"
+    printf '    %s    later, in the control panel. Or skip it and add it any time:%s\n' "$D" "$R"
+    printf '    %s    %s%s\n' "$D" "$EVPN_DOCS" "$R"
+}
+
 banner
 
 # --- preflight ----------------------------------------------------------------------
+if [ "$DRY_RUN" = no ] && [ "$(id -u)" = 0 ]; then
+    # Root-only: it records every command the installer runs. Older installers
+    # logged the hotspot password (as an argument); scrub it.
+    ( umask 077; : >>"$LOG" )
+    chmod 600 "$LOG"
+    sed -i -E 's/(MARINER_HOTSPOT_PASSWORD=)[^ ]*/\1[redacted]/g; s/(with password: ).*/\1[redacted]/' "$LOG"
+    echo "=== $(date -Is) bootstrap" >>"$LOG"
+fi
+# Choices from an earlier run.
+PREV_HOTSPOT=""
+if [ -r "$INSTALL_CONF" ]; then
+    PREV_HOTSPOT=$(sed -n 's/^HOTSPOT=\(yes\|no\)$/\1/p' "$INSTALL_CONF" | tail -1)
+fi
+INSTALLED=no
+[ -d "$DIR/.git" ] && [ -x /usr/local/lib/mariner/bin/mariner-ctl ] && INSTALLED=yes
 section "Checking this machine"
 [ "$(id -u)" = 0 ] || [ "$DRY_RUN" = yes ] || die "run as root (… | sudo bash)"
 ARCH=$(uname -m)
@@ -256,9 +391,33 @@ command -v nmcli >/dev/null && systemctl is-active --quiet NetworkManager \
     || die "NetworkManager isn't running. Raspberry Pi OS Bookworm and later use it by default."
 done_line "NetworkManager is running"
 
+if [ "$ADD_EVPN" = yes ]; then
+    # Only add ExpressVPN: no questions, packages, Geph, hotspot or settings changes.
+    [ -d "$DIR/.git" ] && [ -x /usr/local/lib/mariner/bin/mariner-ctl ] \
+        || die "Mariner isn't installed here yet. Run the installer without --add-expressvpn first."
+    done_line "Mariner is installed ($(git -C "$DIR" log -1 --format=%h 2>/dev/null || echo '?'))"
+    TOTAL=2
+    step "ExpressVPN installer"
+    evpn_check "$EXPRESSVPN_INSTALLER" || die "$EVPN_ERR"
+    done_line "$(basename "$EXPRESSVPN_INSTALLER"): ExpressVPN's Linux installer"
+    step "ExpressVPN"
+    if [ "$DRY_RUN" = yes ]; then
+        printf '\n  %sDry run: nothing was changed.%s\n\n' "$B" "$R"
+        exit 0
+    fi
+    install_evpn
+    printf '\n  %s%sExpressVPN added.%s Open the control panel, VPN, choose ExpressVPN and sign in\n' "$GREEN$B" "$TICK" "$R"
+    printf '  with the activation code from your ExpressVPN account.\n\n'
+    exit 0
+fi
+
 ap_and_client() {  # some interface combination allows a client (uplink) and an AP at once
     iw list 2>/dev/null | awk '/^[[:space:]]*\* #\{/ && /managed/ && /#\{[^}]*[ ,]AP[ ,}]/ {f = 1} END {exit !f}'
 }
+if [ "$HOTSPOT" = auto ] && [ "$PREV_HOTSPOT" = no ]; then
+    HOTSPOT=no
+    skip_line "hotspot: off, as chosen before (--hotspot turns it on)"
+fi
 if [ "$HOTSPOT" = auto ]; then
     if [ -e /sys/class/net/wlan0 ] && command -v iw >/dev/null && ap_and_client; then
         HOTSPOT=yes
@@ -271,18 +430,22 @@ if [ "$HOTSPOT" = auto ]; then
     [ "$HOTSPOT" = no ] || done_line "Wi-Fi radio can run the uplink and a hotspot at once"
 fi
 
-if [ -n "${SSH_CONNECTION:-}" ]; then
-    SSH_IF=$(ip route get "${SSH_CONNECTION%% *}" 2>/dev/null | grep -o 'dev [^ ]*' | cut -d' ' -f2 || true)
-    if [ "$SSH_IF" = wlan0 ] && [ "$HOTSPOT" = yes ]; then
-        warn "you're connected over Wi-Fi (wlan0). Creating the hotspot on the same radio can drop this SSH session for a moment; the install continues on the Pi regardless."
-        pause_or_yes "Installing over Wi-Fi."
-    fi
+# sudo drops SSH_CONNECTION, so look at the live SSH connections themselves.
+SSH_ON_WLAN=no
+ssh_conn=${SSH_CONNECTION:-}
+for peer in ${ssh_conn%% *} $(ss -Htn state established '( sport = :22 )' 2>/dev/null | awk '{print $4}'         | sed -E 's/:[0-9]+$//; s/^\[|\]$//g; s/^::ffff://'); do
+    dev=$(ip route get "$peer" 2>/dev/null | grep -o 'dev [^ ]*' | cut -d' ' -f2 || true)
+    [ "$dev" = wlan0 ] && SSH_ON_WLAN=yes
+done
+if [ "$SSH_ON_WLAN" = yes ]; then
+    warn "an SSH session is connected over Wi-Fi (wlan0). Mariner turns wlan0 into the uplink to hotel networks and refuses new SSH logins from it; reconnect over ethernet or to Mariner's own hotspot afterwards. The install itself continues on the Pi."
+    pause_or_yes "SSH over Wi-Fi."
 fi
 
 HOTSPOT_EXISTS=no CUR_SSID=""
 if nmcli -t -f NAME con show 2>/dev/null | grep -x mariner-hotspot >/dev/null; then
     HOTSPOT_EXISTS=yes
-    CUR_SSID=$(nmcli -g 802-11-wireless.ssid con show mariner-hotspot 2>/dev/null || true)
+    CUR_SSID=$(nmcli -g 802-11-wireless.ssid con show mariner-hotspot 2>/dev/null | sed 's/\\\(.\)/\1/g' || true)
     [ "$SSID_SET" = yes ] || HOTSPOT_SSID=${CUR_SSID:-$HOTSPOT_SSID}
 fi
 GEPH_HAVE=""
@@ -290,6 +453,23 @@ GEPH_HAVE=""
 FW=/usr/lib/firmware/cypress/cyfmac43455-sdio-minimal.bin
 FW_AVAILABLE=no
 [ -f "$FW" ] && FW_AVAILABLE=yes
+if [ "$INSTALLED" = yes ]; then
+    # A re-run keeps earlier choices unless told otherwise.
+    [ "$HOSTNAME_SET" = yes ] || HOSTNAME_NEW=$(hostname -s 2>/dev/null | tr 'A-Z' 'a-z' || echo mariner)
+    valid_hostname "$HOSTNAME_NEW" || HOSTNAME_NEW=mariner
+    if [ "$FW_SET" = no ] && [ "$FW_AVAILABLE" = yes ] && \
+       [ "$(readlink -f /usr/lib/firmware/cypress/cyfmac43455-sdio.bin)" != "$FW" ]; then
+        MINIMAL_FIRMWARE=no
+    fi
+    if [ "$CLOUD_SET" = no ] && [ -d /etc/cloud ] && [ ! -e /etc/cloud/cloud-init.disabled ]; then
+        DISABLE_CLOUD_INIT=no
+    fi
+    if [ "$GEPH_SET" = no ]; then
+        if [ -z "$GEPH_HAVE" ]; then GEPH=skip      # declined before
+        elif [ "$GEPH_HAVE" != "$GEPH_VERSION" ]; then GEPH=keep; fi   # e.g. --geph-binary
+    fi
+    if [ "$OUTLINE_SET" = no ] && [ ! -x /usr/local/bin/sslocal ]; then OUTLINE=no; fi
+fi
 
 # --- questions ----------------------------------------------------------------------------
 if [ "$WIZARD" = yes ]; then
@@ -315,7 +495,7 @@ if [ "$WIZARD" = yes ]; then
                     ask_secret HOTSPOT_PASSWORD "Password" "(8-63 characters; Enter makes one up)"
                 fi
                 [ -z "$HOTSPOT_PASSWORD" ] || valid_pw "$HOTSPOT_PASSWORD" && break
-                warn "8-63 characters, please"
+                warn "8-63 plain ASCII characters (or 64 hex digits), please"
             done
         fi
     else
@@ -339,6 +519,9 @@ if [ "$WIZARD" = yes ]; then
         if [ "$GEPH_HAVE" = "$GEPH_VERSION" ]; then
             ask_yn ans "Keep Geph $GEPH_VERSION (already installed)?" yes
             [ "$ans" = yes ] || GEPH=skip
+        elif [ -n "$GEPH_HAVE" ]; then
+            ask_yn ans "Keep the installed Geph?" yes "(no: compile $GEPH_VERSION, 30-60 min)"
+            [ "$ans" = yes ] && GEPH=keep || GEPH=build
         else
             ask_yn ans "Geph: compile it now?" yes "(30-60 min on a Pi 4)"
             [ "$ans" = yes ] || GEPH=skip
@@ -348,11 +531,12 @@ if [ "$WIZARD" = yes ]; then
         ask_yn OUTLINE "Outline (Shadowsocks) client?" yes "(small download)"
     fi
     if [ "$EVPN_SET" = no ] && [ ! -x /opt/expressvpn/bin/expressvpnctl ]; then
+        evpn_help
         while :; do
-            ask EXPRESSVPN_INSTALLER "ExpressVPN: path to its Linux .run installer" "skip"
-            [ "$EXPRESSVPN_INSTALLER" != skip ] || { EXPRESSVPN_INSTALLER=""; break; }
-            [ -f "$EXPRESSVPN_INSTALLER" ] && break
-            warn "$EXPRESSVPN_INSTALLER not found (download it from your ExpressVPN account, or Enter to skip)"
+            ask src "ExpressVPN installer (path or https:// link)" "skip"
+            [ "$src" != skip ] || { EXPRESSVPN_INSTALLER=""; break; }
+            evpn_check "$src" && break
+            warn "$EVPN_ERR"
         done
     fi
 
@@ -372,6 +556,10 @@ if [ "$WIZARD" = yes ]; then
     fi
 fi
 
+if [ "$EVPN_SET" = yes ] && [ -n "$EXPRESSVPN_INSTALLER" ] && [[ "$EXPRESSVPN_INSTALLER" != "$EVPN_CACHE"/* ]]; then
+    evpn_check "$EXPRESSVPN_INSTALLER" || die "--expressvpn-installer: $EVPN_ERR"
+fi
+
 GEN_PASSWORD=no
 if [ "$HOTSPOT" = yes ] && [ -z "$HOTSPOT_PASSWORD" ] && [ "$HOTSPOT_EXISTS" = no ]; then
     # Read a fixed amount (no SIGPIPE under pipefail): ~500 usable characters, keep 12.
@@ -385,7 +573,7 @@ row() { printf '    %s%-12s%s %s\n' "$D" "$1" "$R" "$2"; }
 if [ "$WIZARD" = yes ]; then qhead "Review"; else section "Plan"; fi
 if [ "$HOTSPOT" = yes ]; then
     pw="unchanged"
-    [ "$GEN_PASSWORD" = no ] || pw="random, shown at the end"
+    [ "$GEN_PASSWORD" = no ] || pw="new: $B$HOTSPOT_PASSWORD$R$D, write it down"
     [ -z "$HOTSPOT_PASSWORD" ] || [ "$GEN_PASSWORD" = yes ] || pw="the one you chose"
     row Hotspot "$HOTSPOT_SSID $D(password: $pw)$R"
 else
@@ -395,6 +583,7 @@ row "Wi-Fi" "country ${COUNTRY:-unchanged}, $([ "$MINIMAL_FIRMWARE" = yes ] && [
 case "$GEPH" in
     build) [ "$GEPH_HAVE" = "$GEPH_VERSION" ] && g="$(yesno yes) Geph $GEPH_VERSION (installed)" || g="$(yesno yes) Geph $GEPH_VERSION ${YEL}(compiles, 30-60 min)${R}" ;;
     binary) g="$(yesno yes) Geph from $GEPH_BINARY" ;;
+    keep) g="$(yesno yes) Geph (installed, kept)" ;;
     skip) g="$(yesno no) Geph" ;;
 esac
 row VPNs "$g"
@@ -410,10 +599,13 @@ if [ "$WIZARD" = yes ]; then
     [ "$go" = yes ] || die "nothing was changed"
 fi
 
-TOTAL=6
-[ -z "$EXPRESSVPN_INSTALLER" ] || TOTAL=7
+TOTAL=5
+[ -z "$EXPRESSVPN_INSTALLER" ] || TOTAL=6
 START=$SECONDS
-[ "$DRY_RUN" = yes ] || { : >>"$LOG"; echo "=== $(date -Is) bootstrap" >>"$LOG"; }
+if [ "$DRY_RUN" = no ]; then
+    install -d -m 0750 /etc/mariner
+    printf 'HOTSPOT=%s\n' "$HOTSPOT" > "$INSTALL_CONF"
+fi
 
 # --- packages -------------------------------------------------------------------------
 step "Packages"
@@ -429,9 +621,13 @@ task "Installing ${#PKGS[@]} packages" apt-get install -y --no-install-recommend
 # --- source ----------------------------------------------------------------------------
 step "Mariner source"
 if [ -d "$DIR/.git" ]; then
-    task "Updating $DIR ($BRANCH)" git -C "$DIR" fetch -q origin "$BRANCH"
-    run git -C "$DIR" checkout -q "$BRANCH"
-    run git -C "$DIR" merge -q --ff-only "origin/$BRANCH" || warn "local changes in $DIR; using them as they are"
+    # Fetch from the given repo (it may differ from the first install) and
+    # check out exactly what was fetched: works for branches and tags alike.
+    task "Updating $DIR ($BRANCH)" git -C "$DIR" fetch -q "$REPO" "$BRANCH"
+    if [ "$DRY_RUN" = no ]; then
+        git -C "$DIR" -c advice.detachedHead=false checkout -q --detach FETCH_HEAD 2>>"$LOG" \
+            || warn "local changes in $DIR; using them as they are"
+    fi
 else
     task "Cloning into $DIR" git clone -q --branch "$BRANCH" "$REPO" "$DIR"
 fi
@@ -455,7 +651,8 @@ if [ -n "$COUNTRY" ]; then
     else
         if run iw reg set "$COUNTRY" 2>/dev/null; then done_line "Wi-Fi country $COUNTRY"
         else warn "couldn't set the Wi-Fi country now (no Wi-Fi?); it applies after a reboot"; fi
-        [ "$DRY_RUN" = yes ] || echo "options cfg80211 ieee80211_regdom=$COUNTRY" > /etc/modprobe.d/mariner-wifi-country.conf
+        [ "$DRY_RUN" = yes ] || { install -d -m 0755 /etc/modprobe.d
+            echo "options cfg80211 ieee80211_regdom=$COUNTRY" > /etc/modprobe.d/mariner-wifi-country.conf; }
     fi
 fi
 if [ "$MINIMAL_FIRMWARE" = yes ] && [ "$FW_AVAILABLE" = yes ] && [ "$(readlink -f /usr/lib/firmware/cypress/cyfmac43455-sdio.bin)" != "$FW" ]; then
@@ -481,7 +678,7 @@ case "$GEPH" in
             export CARGO_HOME=/var/cache/mariner/cargo RUSTUP_HOME=/var/cache/mariner/rustup
             run install -d /var/cache/mariner
             if [ ! -x "$CARGO_HOME/bin/cargo" ]; then
-                task "Installing the Rust toolchain" sh -c "curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --no-modify-path"
+                task "Installing the Rust toolchain" bash -o pipefail -c "curl -sSf https://sh.rustup.rs | sh -s -- -y -q --profile minimal --no-modify-path"
             fi
             MEM_GB=$(awk '/MemTotal/ {print int($2/1048576)}' /proc/meminfo)
             JOBS=$(( MEM_GB >= 3 ? $(nproc) : 2 ))
@@ -494,6 +691,8 @@ case "$GEPH" in
     binary)
         run install -m 0755 "$GEPH_BINARY" /usr/local/bin/geph5-client
         done_line "geph5-client installed from $GEPH_BINARY" ;;
+    keep)
+        done_line "Geph already installed (kept)" ;;
     skip)
         skip_line "skipped" ;;
 esac
@@ -502,20 +701,17 @@ esac
 step "Mariner"
 SSID_ENV=""
 [ "$SSID_SET" = no ] || SSID_ENV=$HOTSPOT_SSID
-task "Installing services, firewall, hotspot and web portal" env MARINER_HOTSPOT="$HOTSPOT" \
-    MARINER_HOTSPOT_SSID="$SSID_ENV" MARINER_HOTSPOT_PASSWORD="$HOTSPOT_PASSWORD" \
-    MARINER_OUTLINE="$OUTLINE" GEPH_SRC=/nonexistent "$DIR/install.sh"
+# Settings go to install.sh in the environment, not as arguments: the
+# password must not show up in the process list or the log.
+export MARINER_HOTSPOT="$HOTSPOT" MARINER_HOTSPOT_SSID="$SSID_ENV" MARINER_HOTSPOT_PASSWORD="$HOTSPOT_PASSWORD" \
+    MARINER_OUTLINE="$OUTLINE" GEPH_SRC=/nonexistent
+task "Installing services, firewall, hotspot and web portal" "$DIR/install.sh"
+unset MARINER_HOTSPOT_PASSWORD
 
 # --- ExpressVPN (optional) ------------------------------------------------------------------
 if [ -n "$EXPRESSVPN_INSTALLER" ]; then
     step "ExpressVPN"
-    # Mariner's drop-in (installed above) confines the daemon to its sandbox
-    # before the installer starts it. The installer refuses to run under sudo.
-    task "Running ExpressVPN's installer (headless)" env -u SUDO_USER -u SUDO_UID -u SUDO_GID -u SUDO_COMMAND \
-        sh "$EXPRESSVPN_INSTALLER" -- --no-gui
-    run systemctl disable --quiet expressvpn-service.service
-    run systemctl stop expressvpn-service.service
-    task "Sandboxing it" "$DIR/install.sh"
+    install_evpn
 fi
 
 # --- done ----------------------------------------------------------------------------------------

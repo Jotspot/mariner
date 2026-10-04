@@ -60,7 +60,7 @@ Notes:
 - **Hotspot + uplink on one radio.** The Pi's built-in Wi-Fi joins the hotel network and broadcasts your private network at the same time. No extra hardware is needed.
 - **Kill switch, two layers.** Policy routing ends in `unreachable`, and an nftables rule blocks anything that doesn't leave through the tunnel. Each layer works on its own; both were verified with leak tests.
 - **DNS that doesn't leak.** All hotspot DNS, including requests to hard-coded resolvers like 8.8.8.8, is redirected through the VPN: DNS-over-HTTPS for Geph and Outline, the VPN's own resolver for ExpressVPN.
-- **Captive-portal handling.** Probes from three companies, plus a tie-breaker, using the hotel network's own DNS. A one-tap *Allow 10 min* opens a window just long enough to log in.
+- **Captive-portal handling.** Probes from three companies, plus a tie-breaker, using the hotel network's own DNS. A one-tap *Allow this device 10 min* lets only the device you're holding through, just long enough to log in.
 - **A control panel that feels like an app.** Material 3 design, phone and desktop layouts, dark mode, live status, exit country flags. It works with no internet (no CDNs) and without JavaScript.
 - **Travel tools.** Wi-Fi scanning and joining, *force 2.4 GHz* for radar-channel networks, *stay on this access point* for mesh networks, a device list, public-IP checks, logs, restart and power-off buttons.
 - **Self-healing.** Mariner reconciles its state every minute and after every network change. It recovers from VPN crashes, Wi-Fi firmware resets and roaming by itself.
@@ -127,7 +127,8 @@ curl -fsSL https://raw.githubusercontent.com/Jotspot/mariner/main/bootstrap.sh |
 | `--geph-binary PATH` | Install an existing `geph5-client` build instead of compiling |
 | `--geph-version V` | Geph version to compile (default: the tested one) |
 | `--no-outline` | Skip the Outline (Shadowsocks) client |
-| `--expressvpn-installer FILE` | Also install ExpressVPN from its official `.run` installer, sandboxed |
+| `--expressvpn-installer FILE` | Also install ExpressVPN from its official `.run` installer (path or `https://` link), sandboxed. See [ExpressVPN](#expressvpn) |
+| `--add-expressvpn FILE` | Add ExpressVPN to an already installed Mariner, changing nothing else |
 | `--no-hotspot` | Don't create the hotspot |
 | `--standard-firmware` | Keep the default Wi-Fi firmware (Mariner switches to the more stable "minimal" build) |
 | `--keep-cloud-init` | Don't disable cloud-init |
@@ -136,7 +137,36 @@ curl -fsSL https://raw.githubusercontent.com/Jotspot/mariner/main/bootstrap.sh |
 | `-y`, `--yes` | Unattended: no questions, no pauses (defaults fill in anything not given) |
 | `--no-wizard` | No questions, but still pause on warnings |
 
-The installer is idempotent: run it again to update Mariner or change options. Package output goes to `/var/log/mariner-install.log`.
+The installer is idempotent: run it again to update Mariner or change options. Package output goes to `/var/log/mariner-install.log` (readable by root only).
+
+## ExpressVPN
+
+ExpressVPN has no open protocol Mariner could speak itself, so Mariner runs **ExpressVPN's official Linux app** and seals it inside its own network namespace (see [Where the traffic goes](#where-the-traffic-goes-per-vpn)). You bring the app's installer, because downloading it needs your account.
+
+**1. Get the installer.** Sign in at [expressvpn.com](https://www.expressvpn.com/), open the **setup** page for your subscription, choose **Linux** and download the app. The file is called something like `expressvpn-linux-universal-14.3.1.15429_release.run`; "universal" means it carries builds for every CPU and picks the right one (Mariner has run it on a Pi 4). The setup page also shows your **activation code**; keep it for step 4. The installer checks that the file really is ExpressVPN's installer before running it.
+
+**2. Copy it to the Pi** from the computer you downloaded it on (use your Pi's user and hostname):
+
+```bash
+scp expressvpn-linux-universal-*.run pi@mariner.local:
+```
+
+**3a. During setup:** when the installer reaches the ExpressVPN question, enter the file's path (or an `https://` link to it). Unattended: `--expressvpn-installer ~/expressvpn-linux-universal-*.run`.
+
+**3b. Later, on an installed Mariner:** run only the ExpressVPN step. Your hotspot, passwords, VPN settings and other providers stay as they are:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Jotspot/mariner/main/bootstrap.sh | sudo bash -s -- --add-expressvpn expressvpn-linux-universal-*.run
+```
+
+Run it again any time to update the app with a newer installer.
+
+**4. Sign in.** In the control panel, open **VPN**, choose **ExpressVPN** and paste the activation code. Mariner never stores it: it goes straight to the app.
+
+Good to know:
+- The app only ever runs inside the `evpn` sandbox, and only while ExpressVPN is the chosen VPN. Its own kill switch ("Network Lock") stays off; Mariner's kill switch covers the hotspot instead, and a guard inside the sandbox drops anything that doesn't leave through ExpressVPN's tunnel.
+- Mariner uses **WireGuard** by default. ExpressVPN's Lightway works too, but runs at only about 1–2 Mbit/s on a Pi 4.
+- The control panel can't install ExpressVPN, on purpose: a panel that could upload and run an installer as root would turn any panel compromise into full control of the Pi.
 
 ## How it works
 
@@ -253,9 +283,11 @@ The detector is tested offline against **108 simulated networks**: redirects, in
 
 ## Using it on the road
 
-- **Captive portal:** the home screen shows *This network needs you to log in*. Tap **Open login page** (or **Allow 10 min** first if the kill switch is on), log in, and Mariner resumes the VPN within a minute.
+- **Captive portal:** the home screen shows *This network needs you to log in*. Tap **Open login page** (or **Allow this device 10 min** first if the kill switch is on: only that device gets direct access), log in, and Mariner resumes the VPN within a minute. If the captured login link has expired, **Open a plain-HTTP page** makes the network show its login page again.
 - **Hotspot won't start on a hotel network:** the network is probably on a 5 GHz radar (DFS) channel, where the Pi may not run a hotspot. In **Wi-Fi**, open the network and choose **2.4 GHz**.
 - **Devices keep dropping on a mesh or hotel network:** the uplink is roaming between access points and dragging the hotspot's channel with it. Turn on **Stay on this access point**.
+- **"Allow this device 10 min" on any network:** if the VPN won't connect although the network looks fine (some hotels hide their login page from detection), the home screen offers it after a few minutes. Only the device that asks gets direct access; everything else stays behind the kill switch.
+- **IPv6-only networks:** the captive-portal check uses IPv4, so an uplink with no IPv4 at all (IPv6-only with NAT64) shows as *offline*, even if it works. The hotspot itself is IPv4-only too.
 - **Change the Wi-Fi country** for the country you're in (`--country` on install, or re-run the installer). It sets the radio's legal channels and power.
 
 ## Security model
@@ -264,7 +296,7 @@ The detector is tested offline against **108 simulated networks**: redirects, in
 - **Least privilege.** The control panel runs as an unprivileged user. Its only privilege is one sudo rule for `mariner-ctl`, which validates every input and takes secrets on stdin, never on the command line.
 - **Secrets stay on the device.** VPN credentials are stored in root-only files. ExpressVPN activation codes are handed to the official app and shredded. Nothing is sent anywhere but the VPN provider.
 - **Hardened control panel.** It's reachable only from the hotspot. Password is scrypt-hashed, sessions are signed SameSite cookies, every form carries a CSRF token, and there's a strict Content-Security-Policy and login rate limiting.
-- **Not exposed upstream.** The control panel, DNS proxy and SSH aren't reachable from the hotel network.
+- **Not exposed upstream.** The control panel, the hotspot's DNS and DHCP, the DNS proxy and SSH aren't reachable from the hotel network.
 - **ExpressVPN is sandboxed** in its own network namespace, so it can't change the Pi's routing, DNS or firewall.
 
 **Limitations to know about:**

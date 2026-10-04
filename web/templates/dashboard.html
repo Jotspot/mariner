@@ -1,11 +1,11 @@
 {% extends "base.html" %}
-{% from "macros.html" import uplink_chip, vpn_chip, vpn_exit_line, csrf_field, portal_banner with context %}
+{% from "macros.html" import uplink_chip, vpn_chip, vpn_exit_line, csrf_field, portal_banner, suspect_banner with context %}
 {% block meta %}<noscript><meta http-equiv="refresh" content="{{ 10 if v.enabled and v.connection != 'connected' else 30 }}"></noscript>{% endblock %}
 {% block content %}
 {% set up = st.uplink or {} %}{% set hs = st.hotspot or {} %}{% set direct = (st.public_ip or {}).direct %}{% set link = up.link or {} %}
-{% if ctl_error %}<div class="snackbar error" role="alert">{{ icon("warning") }}<span>{{ ctl_error }}</span></div>{% endif %}
+<div class="live-slot" data-live="dash-error">{% if ctl_error %}<section class="card error" role="alert"><p class="body-m">{{ icon("warning") }} Mariner couldn't read its status: {{ ctl_error }}</p></section>{% endif %}</div>
 <div class="layout cols-2">
-  <div class="span-all live-slot" data-live="dash-banner">{% if up.state == "portal" %}{{ portal_banner(up, csrf) }}{% endif %}</div>
+  <div class="span-all live-slot" data-live="dash-banner">{% if up.state == "portal" %}{{ portal_banner(up, csrf) }}{% elif v.suspect_portal %}{{ suspect_banner(v, csrf) }}{% endif %}</div>
 
   <section class="card {{ 'primary' if v.connection == 'connected' }}" data-live="dash-vpn">
     <div class="card-head">

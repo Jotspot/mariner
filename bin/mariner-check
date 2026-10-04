@@ -20,6 +20,7 @@ import json
 import os
 import random
 import re
+import secrets
 import socket
 import struct
 import subprocess
@@ -32,6 +33,7 @@ IFACE = "wlan0"
 STATE_FILE = "/run/mariner/portal.json"
 TIMEOUT = 4.0
 PROBE_BUDGET = 8.0   # wall-clock cap for one probe (DNS + HTTP)
+RECONCILE_TIMEOUT = 150  # mariner-ctl check allows probes (~20 s) + this; keep the two in step
 
 PROBES = [
     # name, url, expected status, expected body (None = don't check body)
@@ -64,9 +66,16 @@ def uplink_info():
     split = lambda s: [x.strip() for x in re.split(r"[|\n]", s) if x.strip()]
     dns = split(dns_raw)
     addrs = [a.split("/")[0] for a in split(addr_raw)]
-    # 100 = connected; 70 = connected but NM's own connectivity check hasn't
-    # passed yet (typical behind a captive portal), so probe in both cases.
-    connected = state.startswith("100") or state.startswith("70")
+    # NM device states: 100 = activated (also behind a captive portal; only
+    # NM's separate connectivity state says "portal"). 70/80/90 = still
+    # configuring IP / checking / secondaries: NM can sit there for a while
+    # with IPv4 already working (e.g. waiting for IPv6), so probe then too, but
+    # only once there is an IPv4 address to probe from.
+    try:
+        code = int(state.split()[0]) if state else 0
+    except ValueError:
+        code = 0
+    connected = code == 100 or (70 <= code < 100 and bool(addrs))
     return connected, ssid, (addrs[0] if addrs else ""), dns
 
 
@@ -322,12 +331,18 @@ def main():
     # self-heal routing and firewall state.
     if os.path.exists("/usr/local/lib/mariner/bin/mariner-ctl"):
         lock.close()
-        subprocess.run(["/usr/local/lib/mariner/bin/mariner-ctl", "reconcile"],
-                       capture_output=True, timeout=150)
+        try:
+            subprocess.run(["/usr/local/lib/mariner/bin/mariner-ctl", "reconcile"],
+                           capture_output=True, timeout=RECONCILE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            run("logger", "-t", "mariner-check", "reconcile took too long")
         # Where VPN traffic exits (rate-limited inside: every 30 s until
-        # confirmed, then every 5 min).
-        subprocess.run(["/usr/local/lib/mariner/bin/mariner-ctl", "vpn-probe"],
-                       capture_output=True, timeout=60)
+        # confirmed, then every 5 min). Detached: it can take up to a minute
+        # and nobody waiting for this check needs it.
+        if "--no-probe" not in sys.argv:
+            run("systemd-run", "--quiet", "--no-block", "--collect", "-p", "StandardOutput=null",
+                f"--unit=mariner-vpn-probe-{os.getpid()}-{secrets.token_hex(3)}",
+                "/usr/local/lib/mariner/bin/mariner-ctl", "vpn-probe")
     if not quiet:
         print(json.dumps(result, indent=1))
 

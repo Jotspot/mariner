@@ -1,7 +1,10 @@
 [Unit]
-Description=Mariner: hotspot DNS via DoH through the VPN
-PartOf=mariner-vpn-geph.target mariner-vpn-outline.target
-After=geph5.service outline-ss.service
+Description=Mariner: hotspot DNS while the VPN is on (DoH through the VPN, local names always)
+# Always running: while the kill switch blocks (VPN starting, or paused for a
+# captive portal) hotspot DNS is still redirected here, and it must keep
+# answering the router's own name and refusing everything else rather than
+# vanish (or leak to the hotel's resolver). It binds 10.42.0.1 with
+# IP_FREEBIND, so it can start before the hotspot is up.
 
 [Service]
 DynamicUser=yes
@@ -11,3 +14,6 @@ RestartSec=3
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target

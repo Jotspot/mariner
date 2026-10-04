@@ -24,19 +24,20 @@
 
   <h2 class="title-m section-title">Available networks</h2>
   <section class="card">
-    {% if nets is none %}
+    {% if scan_error %}
+      <p class="body-m">Scan failed: {{ scan_error }}</p>
+      <div class="card-actions"><a class="btn filled" href="/wifi?scan=1">{{ icon("refresh") }}Try again</a></div>
+    {% elif nets is none %}
       <p class="body-m">Scan to see networks nearby. It takes about 10 seconds.</p>
       <div class="card-actions">
         <a class="btn filled" href="/wifi?scan=1">{{ icon("search") }}Scan</a>
       </div>
-    {% elif scan_error %}
-      <p class="body-m">Scan failed: {{ scan_error }}</p>
-      <div class="card-actions"><a class="btn filled" href="/wifi?scan=1">{{ icon("refresh") }}Try again</a></div>
     {% elif not nets %}
       <p class="body-m">No networks found.</p>
       <div class="card-actions"><a class="btn filled" href="/wifi?scan=1">{{ icon("refresh") }}Scan again</a></div>
     {% else %}
       <ul class="list">
+      {% set saved_ssids = saved|map(attribute="ssid")|list %}
       {% for n in nets %}
         <li>
           <details class="item-expand">
@@ -50,10 +51,14 @@
             </summary>
             <form class="expand-body" method="post" action="/wifi/connect">
               {{ csrf_field(csrf) }}<input type="hidden" name="ssid" value="{{ n.ssid }}">
-              {% if n.secure %}
+              {% set is_saved = n.ssid in saved_ssids %}
+              {% if n.kind in ("enterprise", "wep") %}
+              <p class="body-m">{% if n.kind == "enterprise" %}This network uses enterprise (802.1X) sign-in with a username and certificate, which Mariner doesn't support.{% else %}This network uses WEP, an obsolete standard Mariner doesn't support.{% endif %}</p>
+              {% else %}
+              {% if n.kind in ("psk", "sae") %}
               <label class="field"><span>Password</span>
-                <input type="password" name="password" autocomplete="off" minlength="8" maxlength="63"></label>
-              <p class="body-s">Leave empty to use the saved password.</p>
+                <input type="password" name="password" autocomplete="off" minlength="8" maxlength="{{ 63 if n.kind == 'sae' else 64 }}" {{ "" if is_saved else "required" }}></label>
+              {% if is_saved %}<p class="body-s">Leave empty to use the saved password.</p>{% endif %}
               {% endif %}
               {% if "5 GHz" in n.bands %}
               <label class="check"><input type="checkbox" name="band" value="bg"> Force 2.4 GHz</label>
@@ -61,6 +66,7 @@
               <div class="card-actions">
                 <button class="btn filled" type="submit" data-busy="Connecting…">Connect</button>
               </div>
+              {% endif %}
             </form>
           </details>
         </li>
@@ -73,6 +79,7 @@
 </div>
 <div class="col">
   <h2 class="title-m section-title">Saved networks</h2>
+  {% if saved_error %}<section class="card error" role="alert"><p class="body-m">{{ icon("warning") }} Couldn't read the saved networks: {{ saved_error }}</p></section>{% endif %}
   <section class="card">
     {% if not saved %}<p class="body-m">None yet.</p>{% endif %}
     <ul class="list">

@@ -4,7 +4,7 @@ Description=Mariner: kill switch before networking starts (fail closed at boot)
 # after NetworkManager. If the VPN was on with its kill switch, block hotspot
 # traffic from the very first moment instead.
 DefaultDependencies=no
-After=local-fs.target
+After=local-fs.target nftables.service
 Before=network-pre.target NetworkManager.service
 Wants=network-pre.target
 

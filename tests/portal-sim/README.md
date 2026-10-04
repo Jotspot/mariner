@@ -7,7 +7,7 @@ servers) without touching `wlan0`, the Pi or the internet.
 ## Run
 
 ```
-python tests/portal-sim/portal_sim.py                 # all scenarios (~45 s, scenarios run in parallel)
+python tests/portal-sim/portal_sim.py                 # all scenarios (~8 s, run in parallel) + uplink-state checks
 python tests/portal-sim/portal_sim.py -k "R1 W4 dns"  # ids (exact) or words in group/description
 python tests/portal-sim/portal_sim.py -v              # per-probe result/status/detail
 python tests/portal-sim/portal_sim.py --json out.json # full results incl. tracebacks
@@ -60,6 +60,7 @@ sc("R9", "redirect", "302 to portal on port 8080", "portal",
 Helpers: `resp()`, `redirect()`, `page()`, `per_host(apple=, google=, ms=, other=)`,
 `dns_reply()`, `hijack_all()`, `blackhole`, `real_dns`, `real_http`.
 
-`suggested-fix.diff` is a patch for `bin/mariner-check` (not applied) with
-which every scenario passes and the worst case drops to about 8 s; check it
-with `--check` against a patched copy.
+The fixes this simulator first suggested (per-probe time budget, bounds-checked
+DNS parsing, end-of-response detection, safe portal URLs) are part of
+`bin/mariner-check`; every scenario passes. A run without `-k` also checks
+how `uplink_info()` treats NetworkManager's device states.

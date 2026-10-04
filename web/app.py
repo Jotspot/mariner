@@ -11,10 +11,12 @@ HttpOnly) carrying a CSRF token that every POST form must echo back.
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
 import secrets
+import socket
 import subprocess
 import threading
 import time
@@ -95,11 +97,62 @@ def _org(text):
     return text.title() if text.isupper() else text
 
 
+def _admin_user():
+    """The Pi's first regular user (uid 1000), the usual SSH login."""
+    try:
+        import pwd
+        return pwd.getpwuid(1000).pw_name
+    except (ImportError, KeyError):
+        return "pi"
+
+
+# Names the panel answers to. Anything else is refused, so a web page that
+# rebinds its own name to 10.42.0.1 can't talk to the panel as "same origin".
+_HOSTNAME = socket.gethostname().split(".")[0].lower() or "mariner"
+ALLOWED_HOSTS = {"10.42.0.1", _HOSTNAME, f"{_HOSTNAME}.local", "mariner", "mariner.local",
+                 "localhost", "127.0.0.1"}  # the last two: an SSH tunnel to the Pi
+
+
+# For setup instructions that name this machine (hostname.local) and its admin user.
+templates.env.globals.update(hostname=(socket.gethostname().split(".")[0] or "mariner"),
+                             ssh_user=os.environ.get("MARINER_SSH_USER") or _admin_user())
 templates.env.filters.update(org=_org, flag=countries.flag, country=countries.name, bytes=_bytes, since=_since,
                              date=_date, duration=_duration, region_label=countries.region_label,
                              region_flag=lambda slug: countries.flag(countries.region(slug)[0]))
 
 _failures = {}  # ip -> (count, locked_until)
+_failures_lock = threading.Lock()
+# Sessions signed out on this device: {sid: exp}. Persisted in the service's
+# state directory so a copied cookie stays dead across restarts.
+REVOKED_FILE = os.path.join(os.environ.get("STATE_DIRECTORY", "/var/lib/mariner-web"), "revoked.json")
+_revoked_lock = threading.Lock()
+
+
+def _load_revoked():
+    try:
+        with open(REVOKED_FILE) as f:
+            data = json.load(f)
+        return {k: v for k, v in data.items() if isinstance(v, (int, float)) and v > time.time()}
+    except (OSError, ValueError, AttributeError):
+        return {}
+
+
+_revoked = _load_revoked()
+
+
+def revoke_session(sid, exp):
+    with _revoked_lock:
+        now = time.time()
+        for k in [k for k, v in _revoked.items() if v <= now]:
+            del _revoked[k]
+        _revoked[sid] = exp
+        try:
+            tmp = f"{REVOKED_FILE}.{os.getpid()}.tmp"
+            with open(tmp, "w") as f:
+                json.dump(_revoked, f)
+            os.replace(tmp, REVOKED_FILE)
+        except OSError:
+            pass  # still revoked in memory until the next restart
 
 
 class CtlError(Exception):
@@ -141,11 +194,23 @@ class StateCache:
         self.lock = threading.Lock()
         self.wake = threading.Event()
         self.started = False
+        self.pinned = {}    # key -> until: an optimistic patch the next fetch must not undo
+
+    ERROR_TTL = 5  # a failed fetch is retried soon, whatever the key's TTL
 
     def ttl(self, key):
+        entry = self.data.get(key)
+        if entry and isinstance(entry[1], CtlError):
+            return self.ERROR_TTL
         if time.time() < self.fast_until and key in self.FAST_TTL:
             return self.FAST_TTL[key]
         return self.TTL.get(key, 5)
+
+    def is_pinned(self, key):
+        return self.pinned.get(key, 0) > time.time()
+
+    def unpin_all(self):
+        self.pinned.clear()
 
     def fetch(self, key):
         try:
@@ -183,7 +248,8 @@ class StateCache:
                 if k in self.FAST_TTL:
                     self.data[k] = (0, v)
         for k in sync or ():
-            self.fetch(k)
+            if not self.is_pinned(k):
+                self.fetch(k)
         self.wake.set()
 
     def patch(self, key, fn):
@@ -193,6 +259,9 @@ class StateCache:
             entry = self.data.get(key)
             if entry and not isinstance(entry[1], CtlError):
                 fn(entry[1])
+                # Held until the background action finishes (run_bg unpins),
+                # at most 3 minutes.
+                self.pinned[key] = time.time() + 180
 
     def start(self):
         if not self.started:
@@ -207,6 +276,8 @@ class StateCache:
             for key, seen in list(self.wanted.items()):
                 if now - seen > 60:
                     continue  # nobody is looking at this right now
+                if self.is_pinned(key):
+                    continue
                 entry = self.data.get(key)
                 if entry is None or now - entry[0] > self.ttl(key):
                     self.fetch(key)
@@ -216,6 +287,8 @@ cache = StateCache()
 _notices = {}  # session csrf -> [(kind, text)] from background actions, shown once
 _notice_lock = threading.Lock()
 _bg_lock = threading.Lock()  # one background action at a time
+_bg_count_lock = threading.Lock()
+_bg_pending = 0  # queued or running background actions
 
 
 def notice(owner, kind, text):
@@ -235,13 +308,22 @@ def run_bg(request, fail_label, *args, data=None, timeout=150):
     Failures are shown (once) to the session that started the action."""
     owner = getattr(request.state, "session", {}).get("csrf")
 
+    global _bg_pending
+    with _bg_count_lock:
+        _bg_pending += 1
+
     def work():
+        global _bg_pending
         with _bg_lock:
             try:
                 ctl(*args, data=data, timeout=timeout)
             except CtlError as e:
                 notice(owner, "err", f"{fail_label}: {e}")
             finally:
+                with _bg_count_lock:
+                    _bg_pending -= 1
+                    if _bg_pending == 0:
+                        cache.unpin_all()  # the router's own state is authoritative again
                 cache.poke()
     threading.Thread(target=work, daemon=True).start()
     cache.poke()
@@ -274,7 +356,8 @@ def unb64(s):
 
 
 def make_cookie(cfg):
-    payload = b64(json.dumps({"exp": int(time.time()) + SESSION_SECS, "csrf": secrets.token_urlsafe(24)}).encode())
+    payload = b64(json.dumps({"exp": int(time.time()) + SESSION_SECS, "csrf": secrets.token_urlsafe(24),
+                              "sid": secrets.token_urlsafe(12)}).encode())
     sig = hmac.new(bytes.fromhex(cfg["cookie_key"]), payload.encode(), hashlib.sha256).digest()
     return f"{payload}.{b64(sig)}"
 
@@ -292,7 +375,11 @@ def session(request):
         data = json.loads(unb64(payload))
     except (ValueError, TypeError):
         return None
-    return data if data.get("exp", 0) > time.time() else None
+    if not isinstance(data, dict) or data.get("exp", 0) <= time.time():
+        return None
+    if data.get("sid") in _revoked:
+        return None
+    return data
 
 
 def check_password(cfg, pw):
@@ -320,6 +407,9 @@ def back(path, msg=None, err=None):
 @app.middleware("http")
 async def guard(request: Request, call_next):
     path = request.url.path
+    host = request.headers.get("host", "").rsplit(":", 1)[0].strip("[]").lower()
+    if host not in ALLOWED_HOSTS:
+        return Response("unknown host", status_code=421)
     if path.startswith("/static/"):
         return await call_next(request)
     if request.method == "POST" and not same_origin(request):
@@ -347,8 +437,10 @@ async def guard(request: Request, call_next):
         # Form submitted by app.js: answer with JSON instead of a redirect.
         loc = urlsplit(resp.headers.get("location", "/"))
         q = parse_qs(loc.query)
+        cookies = [(k, v) for k, v in resp.raw_headers if k.lower() == b"set-cookie"]
         resp = JSONResponse({"msg": (q.get("m") or [None])[0], "err": (q.get("e") or [None])[0],
                              "location": loc.path or "/"})
+        resp.raw_headers.extend(cookies)  # e.g. the new session after a password change
     resp.headers["Cache-Control"] = "no-store"
     return resp
 
@@ -403,15 +495,19 @@ def login_page(request: Request):
 @app.post("/login")
 def login_post(request: Request, password: str = Form(...)):
     ip = request.client.host if request.client else "?"
-    count, until = _failures.get(ip, (0, 0))
-    if until > time.time():
-        return back("/login", err=f"Too many attempts. Try again in {int(until - time.time())} s.")
-    cfg = portal_cfg()
-    if not cfg or not check_password(cfg, password):
+    # Count the attempt before checking it, atomically: parallel requests
+    # can't all slip past the limit while scrypt runs.
+    with _failures_lock:
+        count, until = _failures.get(ip, (0, 0))
+        if until > time.time():
+            return back("/login", err=f"Too many attempts. Try again in {int(until - time.time())} s.")
         count += 1
         _failures[ip] = (count, time.time() + 60 if count >= 5 else 0)
+    cfg = portal_cfg()
+    if not cfg or not check_password(cfg, password):
         return back("/login", err="Wrong password.")
-    _failures.pop(ip, None)
+    with _failures_lock:
+        _failures.pop(ip, None)
     resp = RedirectResponse("/", status_code=303)
     resp.set_cookie(COOKIE, make_cookie(cfg), max_age=SESSION_SECS, httponly=True, samesite="strict")
     return resp
@@ -419,7 +515,22 @@ def login_post(request: Request, password: str = Form(...)):
 
 @app.post("/logout")
 def logout(request: Request):
+    sess = session(request)
+    if sess and sess.get("sid"):
+        revoke_session(sess["sid"], sess.get("exp", time.time() + SESSION_SECS))
     resp = RedirectResponse("/login", status_code=303)
+    resp.delete_cookie(COOKIE)
+    return resp
+
+
+@app.post("/logout/everywhere")
+def logout_everywhere(request: Request):
+    """Sign out every device: a new cookie-signing key invalidates all sessions."""
+    try:
+        ctl("portal-revoke-sessions")
+    except CtlError as e:
+        return back("/system", err=str(e))
+    resp = RedirectResponse("/login?m=" + quote("Signed out on every device."), status_code=303)
     resp.delete_cookie(COOKIE)
     return resp
 
@@ -449,23 +560,40 @@ def portal_page(request: Request):
         st = cache.get("status")
     except CtlError as e:
         return back("/", err=str(e))
-    return render(request, "portal.html", "home", st=st)
+    g = st.get("vpn") or {}
+    left = (g.get("login_window_until") or 0) - time.time()
+    return render(request, "portal.html", "home", st=st, client_ip=hotspot_client(request),
+                  window_mins=max(1, round(left / 60)) if left > 0 else 0)
 
 
 @app.post("/portal/check")
 def portal_check(request: Request):
-    run_bg(request, "Checking failed", "check", timeout=150)
+    run_bg(request, "Checking failed", "check", timeout=200)
     return back("/portal", msg="Checking the connection again…")
+
+
+def hotspot_client(request):
+    """The requester's address if it is a hotspot device (10.42.0.2-254), else None."""
+    try:
+        ip = ipaddress.IPv4Address(request.client.host)
+    except (AttributeError, ValueError):
+        return None
+    if ip in ipaddress.IPv4Network("10.42.0.0/24") and ip.packed[3] not in (0, 1, 255):
+        return str(ip)
+    return None
 
 
 @app.post("/portal/allow")
 def portal_allow(request: Request):
+    ip = hotspot_client(request)
+    if not ip:
+        return back("/portal", err="Only a device on the hotspot can be let through.")
     try:
-        ctl("portal-login-allow")
+        ctl("portal-login-allow", ip)
     except CtlError as e:
         return back("/portal", err=str(e))
     cache.poke(sync=["status"])
-    return back("/portal", msg="Direct access allowed for 10 minutes. Log in now.")
+    return back("/portal", msg="This device can reach the network directly for 10 minutes. Log in now.")
 
 
 # --- Wi-Fi -------------------------------------------------------------------------
@@ -473,15 +601,20 @@ def portal_allow(request: Request):
 @app.get("/wifi", response_class=HTMLResponse)
 def wifi_page(request: Request, scan: int = 0):
     nets, saved, st, link = None, [], {}, {}
+    saved_error = scan_error = None
     try:
         ws = cache.get("wifi-saved")
         saved, link = ws["profiles"], ws.get("link") or {}
         st = cache.get("status")
-        if scan:
-            nets = wifi_scan()
     except CtlError as e:
-        return render(request, "wifi.html", "wifi", saved=saved, nets=nets, st=st, link=link, scan_error=str(e))
-    return render(request, "wifi.html", "wifi", saved=saved, nets=nets, st=st, link=link)
+        saved_error = str(e)
+    if scan:
+        try:
+            nets = wifi_scan()
+        except CtlError as e:
+            nets, scan_error = [], str(e)
+    return render(request, "wifi.html", "wifi", saved=saved, nets=nets, st=st, link=link,
+                  scan_error=scan_error, saved_error=saved_error)
 
 
 _scan = {"at": 0, "nets": None}
@@ -550,10 +683,13 @@ def geph_redirect():
 def vpn_page(request: Request):
     try:
         v = cache.get("status")["vpn"]
-        exits = cache.get("vpn-exits")["exits"] if v["provider"] == "geph" else []
-        regions = cache.get("vpn-exits --expressvpn")["regions"] if v["provider"] == "expressvpn" else []
     except CtlError as e:
         return back("/", err=str(e))
+    try:  # optional: the page works without them (they're retried soon)
+        exits = cache.get("vpn-exits")["exits"] if v["provider"] == "geph" else []
+        regions = cache.get("vpn-exits --expressvpn")["regions"] if v["provider"] == "expressvpn" else []
+    except (CtlError, KeyError, TypeError):
+        exits, regions = [], []
     # ExpressVPN locations grouped by country, alphabetically, for the picker.
     groups = {}
     for r in regions:
@@ -688,14 +824,27 @@ def hotspot_page(request: Request):
 
 @app.post("/hotspot")
 def hotspot_post(request: Request, ssid: str = Form(""), password: str = Form(""), band: str = Form("")):
-    data = {k: v for k, v in (("ssid", ssid.strip()), ("password", password), ("band", band)) if v}
+    try:
+        cur = cache.get("hotspot-get")
+    except CtlError:
+        cur = {}
+    ssid = ssid.strip()
+    data = {}
+    if ssid and ssid != cur.get("ssid"):
+        data["ssid"] = ssid
+    if password:
+        data["password"] = password
+    if band and band != cur.get("band"):
+        data["band"] = band
+    if not data:
+        return back("/hotspot", msg="Nothing changed.")
     try:
         ctl("hotspot-set", data=data)
     except CtlError as e:
         return back("/hotspot", err=str(e))
     cache.poke()
     return back("/hotspot", msg="Saved. The hotspot restarts now. Reconnect your device if it drops"
-                + (" (use the new name/password)." if ssid or password else "."))
+                + (" (use the new name/password)." if "ssid" in data or "password" in data else "."))
 
 
 # --- system ------------------------------------------------------------------------
@@ -742,9 +891,17 @@ def system_poweroff(request: Request):
 
 @app.post("/system/password")
 def system_password(request: Request, current: str = Form(...), password: str = Form(...), confirm: str = Form(...)):
+    ip = "pw:" + (request.client.host if request.client else "?")
+    with _failures_lock:
+        count, until = _failures.get(ip, (0, 0))
+        if until > time.time():
+            return back("/system", err=f"Too many attempts. Try again in {int(until - time.time())} s.")
+        _failures[ip] = (count + 1, time.time() + 60 if count + 1 >= 5 else 0)
     cfg = portal_cfg()
     if not check_password(cfg, current):
         return back("/system", err="Current password is wrong.")
+    with _failures_lock:
+        _failures.pop(ip, None)
     if len(password) < 8 or password != confirm:
         return back("/system", err="New passwords must match and be at least 8 characters.")
     try:

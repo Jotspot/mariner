@@ -20,16 +20,17 @@ up)
     fi
     ip addr replace "$HOST_IP/30" dev "$HOST_IF"
     ip link set "$HOST_IF" up
-    ip -n "$NS" link set lo up
-    ip -n "$NS" addr replace "$NS_IP/30" dev "$NS_IF"
-    ip -n "$NS" link set "$NS_IF" up
-    ip -n "$NS" route replace default via "$HOST_IP"
-    ip -n "$NS" route replace "$HOTSPOT_NET" via "$HOST_IP"
-    ip netns exec "$NS" sysctl -qw net.ipv4.ip_forward=1 \
+    nsenter --net="/run/netns/$NS" ip link set lo up
+    nsenter --net="/run/netns/$NS" ip addr replace "$NS_IP/30" dev "$NS_IF"
+    nsenter --net="/run/netns/$NS" ip link set "$NS_IF" up
+    nsenter --net="/run/netns/$NS" ip route replace default via "$HOST_IP"
+    nsenter --net="/run/netns/$NS" ip route replace "$HOTSPOT_NET" via "$HOST_IP"
+    # nsenter, not "ip netns exec": no /sys remount (works in containers too).
+    nsenter --net="/run/netns/$NS" sysctl -qw net.ipv4.ip_forward=1 \
         net.ipv6.conf.all.disable_ipv6=1 net.ipv6.conf.default.disable_ipv6=1
     mkdir -p "/etc/netns/$NS"
     [ -s "/etc/netns/$NS/resolv.conf" ] || echo "nameserver 1.1.1.1" > "/etc/netns/$NS/resolv.conf"
-    ip netns exec "$NS" nft -f - <<'EOF'
+    nsenter --net="/run/netns/$NS" nft -f - <<'EOF'
 table inet mariner_guard {}
 delete table inet mariner_guard
 table inet mariner_guard {
@@ -40,9 +41,9 @@ table inet mariner_guard {
     }
     chain output {
         type filter hook output priority filter - 20; policy accept;
-        # Mariner's DNS forwarder (user mariner) may only use the tunnel, apart
+        # Mariner's DNS forwarder (user mariner-dns) may only use the tunnel, apart
         # from its answers back to the host end of the veth (10.200.0.1).
-        meta skuid "mariner" ip daddr != 10.200.0.0/30 oifname != { "wgexpressvpn*", "tun*", "lo" } counter drop comment "dns via tunnel only"
+        meta skuid "mariner-dns" ip daddr != 10.200.0.0/30 oifname != { "wgexpressvpn*", "tun*", "lo" } counter drop comment "dns via tunnel only"
     }
     chain postrouting {
         type nat hook postrouting priority srcnat; policy accept;

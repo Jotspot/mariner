@@ -27,6 +27,7 @@ VPN providers (exactly one runs at a time):
 import base64
 import fcntl
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -49,7 +50,7 @@ VPN_STATE = f"{RUN}/vpn.json"         # written by reconcile
 EXIT_PROBE = f"{RUN}/vpn-exit.json"   # where VPN traffic comes out (geo lookup through the tunnel)
 CONNECTED_SINCE = f"{RUN}/vpn-connected-since"
 GEPH_ACCOUNT = f"{RUN}/geph-account.json"
-LOGIN_WINDOW = f"{RUN}/portal-login-until"
+LOGIN_WINDOW = f"{RUN}/portal-login.json"  # {"until", "ips", "opened_in"}: devices allowed out directly
 PUBLIC_IP = f"{RUN}/public-ip.json"
 EXITS_CACHE = "/var/lib/mariner/geph-exits.json"
 
@@ -60,6 +61,8 @@ TABLE, RULE_PRIO = "100", "1000"
 CONTROL = ("127.0.0.1", 12222)
 SOCKS = "127.0.0.1:9909"
 LOGIN_WINDOW_SECS = 600
+ALLOW_PRIO = 900                 # ip rules for login-window devices (900-909), ahead of the VPN rules (1000+)
+SUSPECT_PORTAL_SECS = 180        # VPN on, network "fine", tunnel still down this long: maybe an undetected portal
 # Tests only: extra interfaces treated exactly like the hotspot (e.g. a veth
 # to a network namespace that plays a phone). Lives in /run, so a reboot
 # clears it.
@@ -144,10 +147,16 @@ def write_json(path, data, mode=0o600, group=None):
 
 
 def write_secret(path, body):
-    fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    tmp = f"{path}.{os.getpid()}.tmp"  # per process: concurrent writers can't interleave
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w") as f:
         f.write(body)
-    os.replace(path + ".tmp", path)
+    os.replace(tmp, path)
+
+
+def unit_name(prefix):
+    """A unique transient unit name (two actions in the same second must not collide)."""
+    return f"{prefix}-{int(time.time())}-{secrets.token_hex(3)}"
 
 
 def stdin_json():
@@ -183,8 +192,51 @@ def ssid_ok(v):
     return v
 
 
-def psk_ok(v):
-    return text(v, "Wi-Fi password", 63, 8)
+def psk_ok(v, sae=False):
+    """A WPA passphrase: 8-63 printable ASCII characters, or (WPA2 only) the
+    64-hex-digit key itself."""
+    if not isinstance(v, str):
+        raise Fail("invalid Wi-Fi password")
+    if not sae and re.fullmatch(r"[0-9A-Fa-f]{64}", v):
+        return v
+    if not 8 <= len(v) <= 63:
+        raise Fail("The Wi-Fi password must be 8-63 characters" + ("" if sae else " (or 64 hex digits)") + ".")
+    if not re.fullmatch(r"[\x20-\x7e]+", v):
+        raise Fail("The Wi-Fi password may only use plain ASCII letters, digits, spaces and symbols.")
+    return v
+
+
+def wifi_kind(security):
+    """nmcli SECURITY field -> how Mariner connects: open, owe, psk, sae,
+    enterprise (802.1X) or wep (the last two aren't supported)."""
+    sec = (security or "").upper().split()
+    if not sec or sec == ["--"]:
+        return "open"
+    if "802.1X" in sec:
+        return "enterprise"
+    if "WEP" in sec:
+        return "wep"
+    if "OWE" in sec and not any(x.startswith("WPA") for x in sec):
+        return "owe"
+    if "WPA3" in sec and not ({"WPA1", "WPA2", "WPA"} & set(sec)):
+        return "sae"
+    return "psk"  # WPA/WPA2, incl. WPA2/WPA3 transition mode
+
+
+def nm_set_secret(con, setting, value):
+    """Store a secret in an NM profile without putting it on a command line
+    (where every local process could read it): `nmcli connection edit` reads
+    its commands from stdin. Read back to make sure it took."""
+    script = f"set {setting} {value}\nsave persistent\nyes\nquit\n"
+    subprocess.run(["nmcli", "connection", "edit", "uuid" if re.fullmatch(r"[0-9a-f-]{36}", con) else "id", con],
+                   input=script, capture_output=True, text=True, timeout=30)
+    got = subprocess.run(["nmcli", "-s", "-g", setting, "connection", "show", con],
+                         capture_output=True, text=True, timeout=15).stdout
+    if ":".join(nm_split(got.rstrip("\n"))) != value:  # -g escapes ':' and '\'
+        # The editor mangled it (e.g. leading spaces): fall back to an argument.
+        subprocess.run(["logger", "-t", "mariner-ctl", "nmcli edit didn't store the secret; using an argument"],
+                       check=False)
+        sh("nmcli", "con", "modify", con, setting, value)
 
 
 def unit_active(unit):
@@ -394,6 +446,8 @@ def fetch_ssconf(url):
     try:
         d = json.loads(body)
     except ValueError:
+        d = None
+    if not isinstance(d, dict):
         raise Fail("the dynamic access key returned something unexpected")
     if d.get("prefix"):
         check_ss_params("prefix=1")
@@ -425,11 +479,22 @@ def outline_from_key(key):
 def write_outline_conf(cfg):
     o = cfg["outline"]
     if o.get("dynamic") and o.get("fetched_at", 0) < time.time() - 3600:
-        try:  # refresh dynamic keys at most hourly; keep the old details if offline
-            cfg["outline"] = o = {**outline_from_key(o["key"]), "name": o.get("name")}
-            write_json(VPN_JSON, cfg)
+        # Refresh dynamic keys at most hourly; keep the old details if offline.
+        # The download happens without the settings lock; the result is saved
+        # against a fresh read, touching only the Outline server details, and
+        # only if the key is still the same (the user may have changed things
+        # meanwhile).
+        try:
+            new = {**outline_from_key(o["key"]), "name": o.get("name")}
         except Fail:
-            pass
+            new = None
+        if new:
+            with cfg_lock():
+                fresh = vpn_cfg()
+                if (fresh.get("outline") or {}).get("key") == o["key"]:
+                    fresh["outline"] = new
+                    write_json(VPN_JSON, fresh)
+            cfg["outline"] = o = new
     write_secret(OUTLINE_CONF, json.dumps({
         "servers": [{"server": o["server"], "server_port": o["server_port"],
                      "password": o["password"], "method": o["method"], "timeout": 300}],
@@ -460,13 +525,27 @@ def evpn(*args, timeout=15, check=False):
     return sh(EVPN_CTL, "-t", str(timeout), *args, check=check, timeout=timeout + 10)
 
 
-def evpn_daemon_up():
+def evpn_daemon_up(wait=30):
+    """Start the daemon if needed and wait until it answers. It takes ~20 s
+    after its unit turns active (e.g. just started by the target), so always
+    wait, not only when starting it here. False if it never answered."""
     if not unit_active("expressvpn-service.service"):
         sh("systemctl", "start", "expressvpn-service.service", timeout=60)
-        for _ in range(20):
-            if os.path.exists("/opt/expressvpn/var/daemon.sock") and evpn("get", "connectionstate"):
-                break
-            time.sleep(0.5)
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if os.path.exists("/opt/expressvpn/var/daemon.sock") and evpn("get", "connectionstate", timeout=4).strip():
+            return True
+        time.sleep(1)
+    return False
+
+
+def evpn_ok(*args, timeout=15):
+    """Run expressvpnctl; True if it succeeded."""
+    try:
+        return subprocess.run([EVPN_CTL, "-t", str(timeout), *args], capture_output=True, text=True,
+                              timeout=timeout + 10).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
 
 
 EVPN_INFO = f"{RUN}/evpn-status.json"
@@ -512,7 +591,7 @@ def evpn_state():
 
 def evpn_tunnel_present():
     """ExpressVPN's tunnel interface exists inside the sandbox."""
-    links = sh("ip", "-n", EVPN_NS, "-br", "link", check=False)
+    links = sh("nsenter", f"--net=/run/netns/{EVPN_NS}", "ip", "-br", "link", check=False)  # no /sys remount
     return bool(re.search(r"^(wgexpressvpn\S*|tun\d+)\s", links, re.M))
 
 
@@ -537,13 +616,14 @@ def evpn_configure(cfg, force=False):
         done = False
     if done and not force:
         return
-    evpn("background", "enable")
-    evpn("set", "networklock", "false")
-    evpn("set", "allowlan", "true")
-    evpn("set", "autoconnect", "false")
-    evpn("set", "protocol", cfg["expressvpn"]["protocol"])
-    with open(EVPN_CONFIGURED, "w") as f:
-        f.write(inv)
+    results = [evpn_ok("background", "enable"), evpn_ok("set", "networklock", "false"),
+               evpn_ok("set", "allowlan", "true"), evpn_ok("set", "autoconnect", "false"),
+               evpn_ok("set", "protocol", cfg["expressvpn"]["protocol"])]
+    if all(results):
+        with open(EVPN_CONFIGURED, "w") as f:
+            f.write(inv)
+    else:  # try again on the next reconcile
+        subprocess.run(["logger", "-t", "mariner-ctl", "ExpressVPN: not all settings applied yet"], check=False)
 
 
 def evpn_switching():
@@ -566,6 +646,31 @@ def evpn_connect(cfg, reason):
         evpn("connect", timeout=5)  # returns before the connection is up
     else:
         evpn("connect", region, timeout=5)
+    # Routing/DNS switch to the tunnel only in a reconcile that sees it up:
+    # run one as soon as it is, not at the next minute's check.
+    sh("systemd-run", "--quiet", "--collect", "-p", "StandardOutput=null", "--unit", unit_name("mariner-evpn-settle"),
+       "/usr/local/lib/mariner/bin/mariner-ctl", "evpn-settle", check=False)
+
+
+def evpn_settled(info, sw):
+    """The connect/switch Mariner started has finished."""
+    if info["state"] != "Connected":
+        return False
+    if sw["region"] == "smart":  # status names the actual location, never "smart"
+        return evpn_tunnel_present()
+    return info.get("region") == sw["region"]
+
+
+def cmd_evpn_settle(args):
+    """Wait (up to 90 s) for ExpressVPN to finish connecting, then reconcile once."""
+    for _ in range(45):
+        time.sleep(2)
+        info = evpn_info(max_age=0)
+        if info["state"] == "Connected" and evpn_tunnel_present():
+            break
+        if not evpn_switching():
+            break
+    return reconcile()
 
 
 def evpn_refresh_regions():
@@ -578,13 +683,52 @@ def evpn_refresh_regions():
 
 # --- routing / firewall ---------------------------------------------------------
 
-def login_window_until():
+def login_window():
+    """The open "log in to the hotel page" window, or None. Expired windows are
+    removed. Reads and removals happen under cfg_lock, like the writes in
+    cmd_portal_login_allow, so a window opened meanwhile is never deleted."""
+    with cfg_lock():
+        return _login_window_locked()
+
+
+def _login_window_locked():
+    """login_window() for callers that already hold cfg_lock."""
+    w = read_json(LOGIN_WINDOW)
+    if not isinstance(w, dict):
+        return None
+    ips = [ip for ip in w.get("ips", []) if isinstance(ip, str) and hotspot_client_ip(ip)]
+    if not ips or not isinstance(w.get("until"), (int, float)) or w["until"] <= time.time():
+        _remove_window("expired" if ips else None)
+        return None
+    return {"until": int(w["until"]), "ips": ips[:10], "opened_in": w.get("opened_in")}
+
+
+def _remove_window(reason):
     try:
-        with open(LOGIN_WINDOW) as f:
-            until = int(f.read().strip())
-    except (OSError, ValueError):
-        return 0
-    return until if until > time.time() else 0
+        os.remove(LOGIN_WINDOW)
+    except FileNotFoundError:
+        return
+    if reason:
+        subprocess.run(["logger", "-t", "mariner-ctl", f"login window closed ({reason})"], check=False)
+
+
+def close_login_window(reason, until=None):
+    """Close the window, but only the one that was read (same `until`): a
+    device may have just opened a new one."""
+    with cfg_lock():
+        w = read_json(LOGIN_WINDOW)
+        if isinstance(w, dict) and (until is None or w.get("until") == until):
+            _remove_window(reason)
+
+
+def hotspot_client_ip(ip):
+    """ip is a hotspot client address (10.42.0.2-254)."""
+    try:
+        a = ipaddress.IPv4Address(ip)
+    except ValueError:
+        return False
+    net = ipaddress.IPv4Network(HOTSPOT_NET)
+    return a in net and a not in (net.network_address, net.broadcast_address, ipaddress.IPv4Address("10.42.0.1"))
 
 
 def hotspot_ifs():
@@ -602,18 +746,39 @@ def tunnel_dev(provider):
     return EVPN_HOST_IF if provider == "expressvpn" else TUN_IF
 
 
-def nft_ruleset(block, dns_tunnel, provider="geph"):
+def nft_ruleset(block, dns_tunnel, provider="geph", evpn_dns=False, allow_ips=()):
+    """The whole `inet mariner` table.
+
+    block: kill switch (hotspot traffic may only leave through the tunnel).
+    dns_tunnel: hotspot DNS is redirected away from dnsmasq (and so from the
+      hotel's resolver): to ExpressVPN's forwarder in its sandbox when evpn_dns
+      (tunnel up), otherwise to mariner-dns on 10.42.0.1:5354, which answers
+      the router's own names and sends the rest through the VPN's SOCKS port,
+      or refuses it while the VPN is down.
+    allow_ips: devices in an open login window: direct traffic and DNS."""
     hs = ", ".join(f'"{i}"' for i in hotspot_ifs())
+    allow = ", ".join(allow_ips)
     forward = ""
     if block:
-        # Kill switch: hotspot traffic may only leave through the tunnel.
-        forward = (f'        iifname {{ {hs} }} oifname != {{ {hs}, "{tunnel_dev(provider)}" }} '
-                   'counter drop comment "killswitch"\n')
-    dns_to = f"{EVPN_NS_IP}:5354" if provider == "expressvpn" else "10.42.0.1:5354"
+        if allow:
+            forward += f'        ip saddr {{ {allow} }} counter accept comment "login window"\n'
+        forward += (f'        iifname {{ {hs} }} oifname != {{ {hs}, "{tunnel_dev(provider)}" }} '
+                    'counter drop comment "killswitch"\n')
+    dns_to = f"{EVPN_NS_IP}:5354" if evpn_dns else "10.42.0.1:5354"
+    stale_dns = ""
+    if dns_tunnel:
+        # New port-53 flows are DNATed to 5354 before they get here; packets of
+        # a flow that began before the redirect keep their old (un-NATed)
+        # conntrack entry and would still reach dnsmasq and the hotel resolver.
+        src = f"ip saddr != {{ {allow} }} " if allow else ""
+        stale_dns = (f'        iifname {{ {hs} }} {src}meta l4proto {{ tcp, udp }} th dport 53 '
+                     'counter drop comment "dns redirected"\n')
     nat = ""
     if dns_tunnel:
-        nat = (f'        iifname {{ {hs} }} udp dport 53 counter dnat ip to {dns_to} comment "dns via vpn"\n'
-               f'        iifname {{ {hs} }} tcp dport 53 counter dnat ip to {dns_to} comment "dns via vpn"\n')
+        if allow:
+            nat += f'        ip saddr {{ {allow} }} counter accept comment "login window: hotel DNS"\n'
+        nat += (f'        iifname {{ {hs} }} udp dport 53 counter dnat ip to {dns_to} comment "dns via vpn"\n'
+                f'        iifname {{ {hs} }} tcp dport 53 counter dnat ip to {dns_to} comment "dns via vpn"\n')
     return f"""table inet mariner {{}}
 delete table inet mariner
 table inet mariner {{
@@ -622,8 +787,16 @@ table inet mariner {{
         # Web portal and VPN DNS proxy are for hotspot clients only.
         iifname != {{ {hs}, "lo" }} tcp dport {{ 80, 5354 }} drop
         iifname != {{ {hs}, "lo" }} udp dport 5354 drop
-        # SSH: never from the upstream (hotel) network; hotspot and ethernet only.
-        iifname "{UPLINK_IF}" tcp dport 22 counter drop comment "no ssh from uplink"
+        # The hotspot's DNS and DHCP (NM's dnsmasq on 10.42.0.1) are for the
+        # hotspot too: don't answer (or fingerprint the router to) the hotel's
+        # network, which could otherwise reach 10.42.0.1 through wlan0.
+        iifname != {{ {hs}, "lo" }} meta l4proto {{ tcp, udp }} th dport 53 counter drop comment "hotspot dns"
+        iifname != {{ {hs}, "lo" }} udp dport 67 counter drop comment "hotspot dhcp"
+{stale_dns}
+        # SSH: no new logins from the upstream (hotel) network; hotspot and
+        # ethernet only. A session that was already open (e.g. the installer's)
+        # isn't cut off mid-way.
+        iifname "{UPLINK_IF}" tcp dport 22 ct state new counter drop comment "no ssh from uplink"
     }}
     chain forward {{
         type filter hook forward priority filter - 10; policy accept;
@@ -646,7 +819,18 @@ table inet mariner {{
 """
 
 
-def apply_routing(route_tunnel, provider="geph"):
+def apply_routing(route_tunnel, provider="geph", allow_ips=()):
+    # Login-window devices: straight to the main table (wlan0), ahead of the
+    # VPN rules. One rule per device at 900, 901, ...
+    allow = {ALLOW_PRIO + n: ip for n, ip in enumerate(allow_ips[:10])} if route_tunnel else {}
+    for prio in range(ALLOW_PRIO, ALLOW_PRIO + 10):
+        have = sh("ip", "rule", "show", "priority", str(prio), check=False)
+        ip = allow.get(prio)
+        if have and (not ip or f"from {ip} " not in have + " "):
+            sh("ip", "rule", "del", "priority", str(prio), check=False)
+            have = ""
+        if ip and not have:
+            sh("ip", "rule", "add", "priority", str(prio), "from", ip, "lookup", "main")
     # One rule per hotspot interface at priorities 1000, 1001, ...; stale ones
     # (e.g. a removed test interface) are deleted.
     wanted = {int(RULE_PRIO) + n: i for n, i in enumerate(hotspot_ifs())} if route_tunnel else {}
@@ -671,11 +855,11 @@ def apply_routing(route_tunnel, provider="geph"):
         sh("ip", "route", "del", "default", "metric", "10", "table", TABLE, check=False)
 
 
-def reconcile(units=True):
+def reconcile(units=True, wait=False):
     """Bring units, routing and firewall in line with settings + portal state."""
     os.makedirs(RUN, exist_ok=True)
     lock = open(f"{RUN}/reconcile.lock", "w")
-    if units:
+    if units or wait:
         fcntl.flock(lock, fcntl.LOCK_EX)
     else:
         # Called from a unit's ExecStopPost, possibly while a full reconcile
@@ -689,21 +873,28 @@ def reconcile(units=True):
     cfg = vpn_cfg()
     provider = cfg["provider"]
     portal = portal_state()
-    # The "allow direct access to log in" window only applies while a portal
-    # is detected; once online, close it so DNS/traffic go back into the VPN.
-    window = login_window_until() if portal == "portal" else 0
-    if portal != "portal" and os.path.exists(LOGIN_WINDOW):
-        os.remove(LOGIN_WINDOW)
+    # The login window lets only the devices that asked for it out directly
+    # (to sign in to the hotel page); everyone else stays behind the kill
+    # switch. It works in any portal state (detection can be wrong) and closes
+    # when it expires, when a detected portal turns into "online", or when the
+    # VPN tunnel comes up.
+    win = login_window()
+    if win and win.get("opened_in") == "portal" and portal == "online":
+        close_login_window("network online", win["until"])
+        win = None
+    allow_ips = win["ips"] if win else []
     has_creds = configured(cfg, provider)
     want_run = cfg["enabled"] and has_creds and portal != "portal"
-    block = cfg["enabled"] and cfg["killswitch"] and not window
+    block = cfg["enabled"] and cfg["killswitch"]
 
     # Fail closed: if the kill switch should be on, block first, before any
     # slow or failing service handling (also covers boot, where nothing else
     # has created the firewall yet).
     if block:
-        apply_routing(True, provider)
-        sh("nft", "-f", "-", input=nft_ruleset(True, True, provider))
+        evpn_dns = (provider == "expressvpn" and want_run and link_exists(EVPN_HOST_IF)
+                    and evpn_tunnel_present())
+        apply_routing(True, provider, allow_ips)
+        sh("nft", "-f", "-", input=nft_ruleset(True, True, provider, evpn_dns, allow_ips))
 
     unit_error = None
     try:
@@ -718,12 +909,21 @@ def reconcile(units=True):
                   if want_run else False)
     else:
         tun_up = link_exists(TUN_IF)
+    # "Up" above only means the tunnel interface exists; for Geph/Outline that
+    # is true even if the server is unreachable. Whether the VPN actually
+    # carries traffic decides when the login window closes and when an
+    # undetected login page is suspected.
+    works = tunnel_works(provider, tun_up) if want_run else False
+    if win and works:
+        close_login_window("VPN connected", win["until"])
+        win, allow_ips = None, []
     route_tunnel = (tun_up and cfg["enabled"]) or block
-    dns_tunnel = route_tunnel and not window
+    dns_tunnel = route_tunnel
 
-    apply_routing(route_tunnel, provider)
-    sh("nft", "-f", "-", input=nft_ruleset(block, dns_tunnel, provider))
-    state = reconcile_state(cfg, provider, portal, has_creds, block, route_tunnel, dns_tunnel, tun_up, window)
+    apply_routing(route_tunnel, provider, allow_ips)
+    sh("nft", "-f", "-", input=nft_ruleset(block, dns_tunnel, provider,
+                                           provider == "expressvpn" and tun_up, allow_ips))
+    state = reconcile_state(cfg, provider, portal, has_creds, block, route_tunnel, dns_tunnel, tun_up, win, works)
     if unit_error and units:
         raise Fail(str(unit_error))
     return state
@@ -761,7 +961,8 @@ def reconcile_units(cfg, provider, want_run):
         write_provider_conf(cfg)
         sh("systemctl", "start", target, timeout=90)
     if want_run and provider == "expressvpn":
-        evpn_daemon_up()  # the target returns before the daemon answers
+        if not evpn_daemon_up():  # the target returns before the daemon answers
+            raise Fail("the ExpressVPN app isn't answering yet")
         if not evpn_logged_in():
             with cfg_lock():
                 fresh = vpn_cfg()
@@ -772,8 +973,11 @@ def reconcile_units(cfg, provider, want_run):
             evpn_configure(cfg)
             info = evpn_info(max_age=0)
             sw = evpn_switching()
-            if sw and info["state"] == "Connected" and info.get("region") == sw["region"]:
-                os.remove(EVPN_SWITCH)  # settled
+            if sw and evpn_settled(info, sw):
+                try:
+                    os.remove(EVPN_SWITCH)  # settled
+                except FileNotFoundError:
+                    pass
                 sw = None
             if sw or info.get("busy"):
                 pass  # a connect is in flight; let it finish
@@ -785,7 +989,26 @@ def reconcile_units(cfg, provider, want_run):
                 evpn_connect(cfg, "tunnel vanished")
 
 
-def reconcile_state(cfg, provider, portal, has_creds, block, route_tunnel, dns_tunnel, tun_up, window):
+def tunnel_works(provider, tun_up):
+    """The VPN carries traffic now (not just: its tunnel interface exists)."""
+    if not tun_up:
+        return False
+    if provider == "expressvpn":
+        return True  # tun_up already means Connected with the tunnel present
+    if provider == "geph":
+        try:
+            info = control_rpc("conn_info", timeout=3)
+        except (OSError, ValueError, Fail):
+            return False
+        return bool(isinstance(info, dict) and info.get("sessions"))
+    # Outline: the last exit probe through this very sslocal instance worked.
+    probe = read_json(EXIT_PROBE, {}) or {}
+    svc = PROVIDERS[provider]["service"]
+    return bool(probe.get("ok") and probe.get("provider") == provider
+                and probe.get("invocation") == unit_prop(svc, "InvocationID"))
+
+
+def reconcile_state(cfg, provider, portal, has_creds, block, route_tunnel, dns_tunnel, tun_up, win, works=False):
     if cfg["enabled"] and portal == "portal":
         mode = "paused-portal"
     elif not cfg["enabled"]:
@@ -801,10 +1024,15 @@ def reconcile_state(cfg, provider, portal, has_creds, block, route_tunnel, dns_t
     if (prev.get("mode"), prev.get("provider"), prev.get("tunnel_routing"), prev.get("blocking_direct"),
             prev.get("dns_via_vpn")) != (mode, provider, route_tunnel, block, dns_tunnel):
         subprocess.run(["logger", "-t", "mariner-ctl", summary], check=False)
+    # Since when the VPN should be up but its tunnel isn't (for "maybe a login page").
+    down_since = None
+    if mode == "on" and not works:
+        down_since = prev.get("down_since") if prev.get("mode") == "on" and prev.get("down_since") else int(time.time())
     state = {"mode": mode, "provider": provider, "enabled": cfg["enabled"], "killswitch": cfg["killswitch"],
              "blocking_direct": block, "tunnel_routing": route_tunnel, "dns_via_vpn": dns_tunnel,
-             "tun_up": tun_up, "login_window_until": window, "portal_state": portal,
-             "updated": int(time.time())}
+             "tun_up": tun_up, "login_window_until": win["until"] if win else 0,
+             "login_window_ips": win["ips"] if win else [], "portal_state": portal,
+             "down_since": down_since, "updated": int(time.time())}
     write_json(VPN_STATE, state, 0o644)
     return state
 
@@ -856,8 +1084,8 @@ def vpn_probe(force=False):
     if not force and same and prev.get("at", 0) > time.time() - interval:
         return prev
     if cfg["provider"] == "expressvpn":
-        if evpn_state() != "Connected" or evpn_switching():
-            return prev
+        if evpn_state() != "Connected" or evpn_switching() or not evpn_tunnel_present():
+            return prev  # never probe around a vanished tunnel (it would find the hotel's IP)
         # Inside the sandbox, through ExpressVPN's tunnel.
         geo = geo_lookup(runner=("ip", "netns", "exec", EVPN_NS))
         if geo:
@@ -980,7 +1208,7 @@ def vpn_status():
         state = info["state"]
         e = cfg["expressvpn"]
         sw = evpn_switching()
-        if sw and state == "Connected" and info.get("region") == sw["region"]:
+        if sw and evpn_settled(info, sw):
             sw = None  # settled (reconcile removes the marker)
         region = info["region"] or e["region"]
         st["expressvpn"].update({"state": state, "active_region": region,
@@ -1018,6 +1246,15 @@ def vpn_status():
         else:
             st["connection"], st["detail"] = "connecting", "Connecting to the Outline server…"
     st["connected_since"] = connected_since(st["connection"] == "connected")
+    # The login window as it is now (the saved state can lag behind a close).
+    win = login_window()
+    st["login_window_until"] = win["until"] if win else 0
+    st["login_window_ips"] = win["ips"] if win else []
+    # The network looks fine to the probes, yet the VPN hasn't come up for a
+    # few minutes: possibly a login page that lets the probe hosts through.
+    down = st.get("down_since")
+    st["suspect_portal"] = bool(mode == "on" and st["connection"] != "connected" and down
+                                and time.time() - down > SUSPECT_PORTAL_SECS)
     return st
 
 
@@ -1058,35 +1295,60 @@ def radio_health():
 # --- subcommands ----------------------------------------------------------------
 
 def cmd_reconcile(args):
-    return reconcile(units="--no-units" not in args)
+    # --no-units: firewall/routing only. Without --wait it gives up if another
+    # reconcile holds the lock (ExecStopPost, which may run inside one);
+    # mariner-tun-up passes --wait so a tunnel that appears mid-reconcile is
+    # still picked up.
+    return reconcile(units="--no-units" not in args, wait="--wait" in args)
 
 
 def cmd_vpn_get(args):
     return vpn_status()
 
 
+class reconcile_lock:
+    """The lock reconcile() holds: provider config writes + restarts take it
+    too, so they never interleave with a reconcile starting the same units."""
+
+    def __enter__(self):
+        os.makedirs(RUN, exist_ok=True)
+        self.f = open(f"{RUN}/reconcile.lock", "w")
+        fcntl.flock(self.f, fcntl.LOCK_EX)
+
+    def __exit__(self, *exc):
+        self.f.close()
+
+
 def cmd_vpn_set(args):
     d = stdin_json()
+    # Network fetches (dynamic Outline keys) happen before taking the lock.
+    outline = None
+    if "outline_key" in d and d["outline_key"] is not None:
+        outline = outline_from_key(text(d["outline_key"], "access key", 4000, 10).strip())
     with cfg_lock():
-        cfg, restart = vpn_set_apply(d)
+        cfg, restart = vpn_set_apply(d, outline)
     target = PROVIDERS[cfg["provider"]]["target"]
     if restart and unit_active(target) and configured(cfg, cfg["provider"]):
         if cfg["provider"] == "expressvpn":
             if "evpn_protocol" in d:
                 evpn("set", "protocol", cfg["expressvpn"]["protocol"])
-            evpn_connect(cfg, "settings changed")
+            if cfg["enabled"] and portal_state() != "portal":
+                evpn_connect(cfg, "settings changed")
         else:
-            write_provider_conf(cfg)
-            sh("systemctl", "restart", PROVIDERS[cfg["provider"]]["service"], timeout=60)
+            with reconcile_lock():
+                write_provider_conf(cfg)
+                sh("systemctl", "restart", PROVIDERS[cfg["provider"]]["service"], timeout=60)
     reconcile()
     return vpn_status()
 
 
-def vpn_set_apply(d):
+def vpn_set_apply(d, outline=None):
+    """Apply validated settings from d (outline: the parsed access key, fetched
+    by the caller before taking the lock). Every field is type-checked."""
     cfg = vpn_cfg()
     restart = False
     if "provider" in d:
-        if d["provider"] not in PROVIDERS:
+        if not isinstance(d["provider"], str) or d["provider"] not in PROVIDERS:
             raise Fail("unknown VPN provider")
         cfg["provider"] = d["provider"]
     if "killswitch" in d:
@@ -1095,7 +1357,8 @@ def vpn_set_apply(d):
         cfg["killswitch"] = d["killswitch"]
     if "exit" in d:
         ex = text(d["exit"], "exit", 64)
-        if ex != "auto" and not re.fullmatch(r"[A-Z]{2}(/[A-Za-z0-9 ._'-]{1,40})?", ex):
+        # Country code, optionally /city: city names can be non-ASCII ("São Paulo").
+        if ex != "auto" and not re.fullmatch(r"[A-Z]{2}(/[\w .'-]{1,40})?", ex):
             raise Fail("invalid exit")
         cfg["geph"]["exit"] = ex
         restart = restart or cfg["provider"] == "geph"
@@ -1105,11 +1368,12 @@ def vpn_set_apply(d):
             cfg["geph"]["credentials"] = None
         elif isinstance(c, dict) and c.get("type") == "secret":
             cfg["geph"]["credentials"] = {"type": "secret", "secret": text(
-                c.get("secret", "").strip(), "account secret", 200, 4, r"[\x21-\x7e]+")}
+                text(c.get("secret"), "account secret", 300).strip(), "account secret", 200, 4, r"[\x21-\x7e]+")}
         elif isinstance(c, dict) and c.get("type") == "password":
             cfg["geph"]["credentials"] = {"type": "password",
-                                          "username": text(c.get("username", "").strip(), "username", 100, 1),
-                                          "password": text(c.get("password", ""), "password", 200, 1)}
+                                          "username": text(text(c.get("username"), "username", 200).strip(),
+                                                           "username", 100, 1),
+                                          "password": text(c.get("password"), "password", 200, 1)}
         else:
             raise Fail("invalid credentials")
         if os.path.exists(GEPH_ACCOUNT):
@@ -1122,16 +1386,17 @@ def vpn_set_apply(d):
         cfg["expressvpn"]["region"] = r
         restart = restart or cfg["provider"] == "expressvpn"
     if "evpn_protocol" in d:
-        if d["evpn_protocol"] not in EVPN_PROTOCOLS:
+        if not isinstance(d["evpn_protocol"], str) or d["evpn_protocol"] not in EVPN_PROTOCOLS:
             raise Fail("unknown ExpressVPN protocol")
         cfg["expressvpn"]["protocol"] = d["evpn_protocol"]
         restart = restart or cfg["provider"] == "expressvpn"
     if "outline_key" in d:
-        k = d["outline_key"]
-        if k is None:
+        if d["outline_key"] is None:
             cfg["outline"] = None
         else:
-            cfg["outline"] = outline_from_key(text(k.strip(), "access key", 4000, 10))
+            if outline is None:  # callers fetch it first (no network I/O under the lock)
+                raise Fail("invalid access key")
+            cfg["outline"] = outline
         restart = restart or cfg["provider"] == "outline"
     if cfg["enabled"] and not configured(cfg, cfg["provider"]):
         cfg["enabled"] = False
@@ -1237,11 +1502,23 @@ def cmd_evpn_logout(args):
 
 
 def cmd_portal_login_allow(args):
-    until = int(time.time()) + LOGIN_WINDOW_SECS
-    with open(LOGIN_WINDOW, "w") as f:
-        f.write(str(until))
-    sh("systemd-run", "--quiet", f"--on-active={LOGIN_WINDOW_SECS + 2}", "--unit", f"mariner-login-window-{until}",
-       "/usr/local/lib/mariner/bin/mariner-ctl", "reconcile", check=False)
+    """Let one hotspot device (args[0], the requester's IP) reach the network
+    directly for LOGIN_WINDOW_SECS, to sign in to a hotel login page. Works in
+    any detected state: a portal can whitelist the probe hosts."""
+    if len(args) != 1 or not hotspot_client_ip(args[0]):
+        raise Fail("usage: portal-login-allow <hotspot client IP>")
+    ip = str(ipaddress.IPv4Address(args[0]))
+    with cfg_lock():
+        win = _login_window_locked() or {"ips": [], "opened_in": portal_state()}
+        ips = [i for i in win["ips"] if i != ip] + [ip]
+        write_json(LOGIN_WINDOW, {"until": int(time.time()) + LOGIN_WINDOW_SECS, "ips": ips[-10:],
+                                  "opened_in": win["opened_in"]}, 0o644)
+    subprocess.run(["logger", "-t", "mariner-ctl", f"login window opened for {ip}"], check=False)
+    # While it's open, check the network every 10 s so it closes soon after
+    # the login goes through (and on expiry). One watcher for all devices.
+    sh("systemd-run", "--quiet", "--collect", "-p", "StandardOutput=null", "--unit", unit_name("mariner-login-watch"),
+       "/bin/sh", "-c", f"n=0; while [ -e {LOGIN_WINDOW} ] && [ $n -lt {LOGIN_WINDOW_SECS // 10 + 3} ]; do "
+       "sleep 10; n=$((n+1)); /usr/local/lib/mariner/bin/mariner-check --quiet || true; done", check=False)
     return reconcile()
 
 
@@ -1274,7 +1551,8 @@ def cmd_wifi_scan(args):
         inuse, ssid, sig, sec, freq = f[:5]
         mhz = int(re.sub(r"\D", "", freq) or 0)
         n = nets.setdefault(ssid, {"ssid": ssid, "signal": 0, "secure": bool(sec.strip() and sec != "--"),
-                                   "security": sec, "bands": [], "aps": 0, "in_use": False})
+                                   "security": sec, "kind": wifi_kind(sec), "bands": [], "aps": 0,
+                                   "in_use": False})
         n["signal"] = max(n["signal"], int(sig or 0))
         n["aps"] += 1
         band = "2.4 GHz" if mhz < 3000 else "5 GHz"
@@ -1312,19 +1590,41 @@ def cmd_wifi_saved(args):
     return {"profiles": client_profiles(), "link": wifi_link()}
 
 
+def scan_security(ssid):
+    """SECURITY of ssid from NM's last scan (no rescan), or None if not seen."""
+    out = sh("nmcli", "-t", "-f", "SSID,SECURITY", "dev", "wifi", "list", "ifname", UPLINK_IF,
+             "--rescan", "no", check=False, timeout=15)
+    for line in out.splitlines():
+        f = nm_split(line)
+        if len(f) >= 2 and f[0] == ssid:
+            return f[1]
+    return None
+
+
 def cmd_wifi_connect(args):
     d = stdin_json()
     ssid = ssid_ok(d.get("ssid"))
     pw = d.get("password") or ""
+    if not isinstance(pw, str):
+        raise Fail("invalid Wi-Fi password")
     band = d.get("band", "auto")
     if band not in ("auto", "bg"):
         raise Fail("invalid band")
+    sec = scan_security(ssid)
+    kind = wifi_kind(sec) if sec is not None else ("psk" if pw else "open")
+    if kind == "enterprise":
+        raise Fail("This network uses enterprise (802.1X) sign-in, which Mariner doesn't support.")
+    if kind == "wep":
+        raise Fail("This network uses WEP, an obsolete and insecure standard Mariner doesn't support.")
     if pw:
-        psk_ok(pw)  # validate before touching any existing profile
+        psk_ok(pw, sae=kind == "sae")  # validate before touching any existing profile
     existing = [p for p in client_profiles() if p["ssid"] == ssid]
+    created = False
     if existing and not pw:
         uuid = existing[0]["uuid"]
     else:
+        if kind in ("psk", "sae") and not pw:
+            raise Fail("This network needs a password.")
         for p in existing:
             sh("nmcli", "con", "delete", p["uuid"], check=False)
         out = sh("nmcli", "con", "add", "type", "wifi", "ifname", UPLINK_IF,
@@ -1332,14 +1632,23 @@ def cmd_wifi_connect(args):
         m = re.search(r"\(([0-9a-f-]{36})\)", out)
         if not m:
             raise Fail("could not create the network profile")
-        uuid = m.group(1)
-        if pw:
-            # nmcli only takes the key as an argument; it is briefly visible
-            # in the process list to local users of the Pi (no one else).
-            sh("nmcli", "con", "modify", uuid, "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", psk_ok(pw))
+        uuid, created = m.group(1), True
+        try:
+            if kind in ("psk", "sae"):
+                sh("nmcli", "con", "modify", uuid, "wifi-sec.key-mgmt", "sae" if kind == "sae" else "wpa-psk")
+                nm_set_secret(uuid, "802-11-wireless-security.psk", pw)
+            elif kind == "owe":
+                sh("nmcli", "con", "modify", uuid, "wifi-sec.key-mgmt", "owe")
+        except (Fail, subprocess.TimeoutExpired):
+            sh("nmcli", "con", "delete", uuid, check=False)
+            raise
     sh("nmcli", "con", "modify", uuid, "802-11-wireless.band", "" if band == "auto" else band)
     p = subprocess.run(["nmcli", "-w", "45", "con", "up", uuid], capture_output=True, text=True, timeout=60)
     if p.returncode != 0:
+        if created:
+            # Don't leave a broken (wrong-password) profile behind that would
+            # autoconnect and be reused by a later empty-password connect.
+            sh("nmcli", "con", "delete", uuid, check=False)
         msg = (p.stderr or p.stdout).strip().splitlines()
         raise Fail("could not connect: " + (msg[-1] if msg else "unknown error"))
     return {"ok": True, "uuid": uuid}
@@ -1388,7 +1697,7 @@ def cmd_hotspot_get(args):
               "con", "show", HOTSPOT).splitlines() + [""] * 4
     stations = sh("iw", "dev", HOTSPOT_IF, "station", "dump", check=False)
     hs = read_json(f"{RUN}/hotspot.json", {}) or {}
-    return {"ssid": vals[0], "band": vals[1], "channel": vals[2], "state": vals[3] or "inactive",
+    return {"ssid": ":".join(nm_split(vals[0])), "band": vals[1], "channel": vals[2], "state": vals[3] or "inactive",
             "clients": stations.count("Station "), "sync": hs}
 
 
@@ -1459,19 +1768,28 @@ def cmd_hotspot_set(args):
     changes = []
     if d.get("ssid"):
         changes += ["802-11-wireless.ssid", ssid_ok(d["ssid"])]
-    if d.get("password"):
-        changes += ["wifi-sec.psk", psk_ok(d["password"])]
+    psk = psk_ok(d["password"]) if d.get("password") else None
     if d.get("band"):
         if d["band"] not in ("a", "bg"):
             raise Fail("invalid band")
         changes += ["802-11-wireless.band", d["band"], "802-11-wireless.channel", "36" if d["band"] == "a" else "6"]
-    if not changes:
+    if not changes and not psk:
         raise Fail("nothing to change")
-    sh("nmcli", "con", "modify", HOTSPOT, *changes)
+    if changes:
+        sh("nmcli", "con", "modify", HOTSPOT, *changes)
+    if psk:
+        nm_set_secret(HOTSPOT, "802-11-wireless-security.psk", psk)
     # Restart in the background so this call can return before the client drops.
-    sh("systemd-run", "--quiet", "--on-active=3", "--unit", f"mariner-hotspot-restart-{int(time.time())}",
+    sh("systemd-run", "--quiet", "--on-active=3", "--unit", unit_name("mariner-hotspot-restart"),
        "/bin/sh", "-c", f"nmcli con up {HOTSPOT}; /usr/local/lib/mariner/bin/mariner-hotspot-sync", check=False)
     return {"ok": True, "restarting": True}
+
+
+def cmd_hotspot_psk(args):
+    """Set the hotspot password (stdin {"password"}) without restarting it.
+    For install.sh, which must not put it on a command line."""
+    nm_set_secret(HOTSPOT, "802-11-wireless-security.psk", psk_ok(stdin_json().get("password")))
+    return {"ok": True}
 
 
 def cmd_public_ip(args):
@@ -1553,18 +1871,20 @@ def cmd_restart(args):
     else:
         raise Fail("unknown service")
     # Delay so the HTTP response gets out first (matters for portal/network).
-    sh("systemd-run", "--quiet", "--on-active=2", "--unit", f"mariner-restart-{svc}-{int(time.time())}",
+    sh("systemd-run", "--quiet", "--on-active=2", "--unit", unit_name(f"mariner-restart-{svc}"),
        *cmd, check=False)
     return {"ok": True}
 
 
 def cmd_check(args):
-    sh("/usr/local/lib/mariner/bin/mariner-check", "--quiet", timeout=150)
+    # mariner-check: probes (<= ~20 s) + reconcile (<= RECONCILE_TIMEOUT 150 s); the exit
+    # probe runs detached. The web panel waits a little longer than this.
+    sh("/usr/local/lib/mariner/bin/mariner-check", "--quiet", timeout=185)
     return read_json(PORTAL_STATE, {})
 
 
 def cmd_reboot(args):
-    sh("systemd-run", "--quiet", "--on-active=3", "--unit", f"mariner-reboot-{int(time.time())}",
+    sh("systemd-run", "--quiet", "--on-active=3", "--unit", unit_name("mariner-reboot"),
        "systemctl", "reboot", check=False)
     return {"ok": True}
 
@@ -1573,7 +1893,7 @@ def cmd_poweroff(args):
     # Delayed so the "shutting down" page reaches the browser first. The Pi 4
     # has no power button: unplug and replug it to start it again.
     subprocess.run(["logger", "-t", "mariner-ctl", "power off requested from the portal"], check=False)
-    sh("systemd-run", "--quiet", "--on-active=3", "--unit", f"mariner-poweroff-{int(time.time())}",
+    sh("systemd-run", "--quiet", "--on-active=3", "--unit", unit_name("mariner-poweroff"),
        "systemctl", "poweroff", check=False)
     return {"ok": True}
 
@@ -1594,14 +1914,27 @@ def cmd_set_portal_password(args):
     return {"ok": True}
 
 
+def cmd_portal_revoke_sessions(args):
+    """Sign every device out of the panel: rotate the cookie-signing key."""
+    with cfg_lock():
+        cfg = read_json(PORTAL_JSON)
+        if not isinstance(cfg, dict) or "scrypt" not in cfg:
+            raise Fail("no panel password is set")
+        cfg["cookie_key"] = secrets.token_hex(32)
+        write_json(PORTAL_JSON, cfg, 0o640, group="mariner")
+    return {"ok": True}
+
+
 COMMANDS = {
     "status": cmd_status, "reconcile": cmd_reconcile,
     "vpn-get": cmd_vpn_get, "vpn-set": cmd_vpn_set, "vpn-enable": cmd_vpn_enable,
     "vpn-exits": cmd_vpn_exits, "vpn-probe": cmd_vpn_probe, "portal-login-allow": cmd_portal_login_allow,
+    "portal-revoke-sessions": cmd_portal_revoke_sessions,
+    "evpn-settle": cmd_evpn_settle,
     "evpn-login": cmd_evpn_login, "evpn-logout": cmd_evpn_logout,
     "wifi-scan": cmd_wifi_scan, "wifi-saved": cmd_wifi_saved, "wifi-connect": cmd_wifi_connect,
     "wifi-forget": cmd_wifi_forget, "wifi-band": cmd_wifi_band, "wifi-lock": cmd_wifi_lock,
-    "hotspot-get": cmd_hotspot_get, "hotspot-set": cmd_hotspot_set, "devices": cmd_devices,
+    "hotspot-get": cmd_hotspot_get, "hotspot-set": cmd_hotspot_set, "hotspot-psk": cmd_hotspot_psk, "devices": cmd_devices,
     "public-ip": cmd_public_ip, "logs": cmd_logs, "restart": cmd_restart, "reboot": cmd_reboot, "poweroff": cmd_poweroff,
     "set-portal-password": cmd_set_portal_password, "check": cmd_check,
 }
@@ -1622,6 +1955,13 @@ def main():
         return 1
     except subprocess.TimeoutExpired:
         print(json.dumps({"error": "timed out"}))
+        return 1
+    except Exception:
+        # A bug: details to the journal, a generic error to the caller.
+        import traceback
+        subprocess.run(["logger", "-t", "mariner-ctl", f"internal error in {sys.argv[1]}: "
+                        + traceback.format_exc().replace("\n", " | ")[-1500:]], check=False)
+        print(json.dumps({"error": "internal error (details in the system log)"}))
         return 1
     print(json.dumps(result))
     return 0

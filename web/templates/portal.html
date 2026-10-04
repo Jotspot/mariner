@@ -11,25 +11,34 @@
         <p class="title-m">{% if up.state == "portal" %}Login required{% elif up.state == "online" %}You're online{% else %}No internet{% endif %}</p></div>
       {{ uplink_chip(up.state) }}
     </div>
+    {% set me_allowed = client_ip in (g.login_window_ips or []) %}
+    {% set can_allow = g.enabled and g.killswitch and client_ip %}
     {% if up.state == "portal" %}
       <p class="body-m">Open the network's login page on this device. When you're done, Mariner notices within a minute{% if g.enabled %} and turns {{ g.provider_name }} back on{% endif %}.</p>
-      {% if g.enabled and g.killswitch and not g.login_window_until %}
-      <p class="body-m mt"><b>The VPN kill switch is blocking direct traffic.</b> Allow direct access for 10 minutes so the login page can load.</p>
-      {% elif g.login_window_until %}
-      <p class="body-m mt">Direct access is allowed for the next few minutes.</p>
-      {% endif %}
-      <div class="card-actions">
-        {% if g.enabled and g.killswitch and not g.login_window_until %}
-        <form method="post" action="/portal/allow" class="inline">{{ csrf_field(csrf) }}
-          <button class="btn tonal" type="submit">Allow 10 min</button></form>
-        {% endif %}
-        <a class="btn filled" href="{{ up.portal_url }}" target="_blank" rel="noopener noreferrer">{{ icon("open") }}Open login page</a>
-      </div>
-      <p class="body-s mt mono">{{ up.portal_url }}</p>
     {% elif up.state == "online" %}
-      <p class="body-m">No login page detected. If a site still asks you to log in, check again.</p>
+      <p class="body-m">No login page detected.{% if g.suspect_portal %} But {{ g.provider_name }} hasn't connected for a few minutes: some hotels hide their login page from detection.{% endif %}</p>
     {% else %}
       <p class="body-m">{{ up.detail or "Mariner can't reach the internet through this network." }}</p>
+    {% endif %}
+    {% if me_allowed %}
+      <p class="body-m mt"><b>This device can reach the network directly{% if window_mins %} for about {{ window_mins }} more minute{{ "s" if window_mins != 1 }}{% endif %}.</b> Other devices stay behind the kill switch. Mariner closes this as soon as you're online.</p>
+    {% elif can_allow %}
+      <p class="body-m mt">{% if up.state == "portal" %}<b>The VPN kill switch is blocking direct traffic,</b> so the login page can't load yet.{% else %}If a site keeps asking you to log in, or the VPN won't connect,{% endif %}
+        allow <b>this device</b> to reach the network directly for 10 minutes. Other devices stay blocked.</p>
+    {% endif %}
+    <div class="card-actions">
+      {% if can_allow and not me_allowed %}
+      <form method="post" action="/portal/allow" class="inline">{{ csrf_field(csrf) }}
+        <button class="btn tonal" type="submit">Allow this device 10 min</button></form>
+      {% endif %}
+      {% if up.state == "portal" and up.portal_url %}
+      <a class="btn filled" href="{{ up.portal_url }}" target="_blank" rel="noopener noreferrer">{{ icon("open") }}Open login page</a>
+      {% endif %}
+      <a class="btn outlined" href="http://neverssl.com/" target="_blank" rel="noopener noreferrer">{{ icon("open") }}Open a plain-HTTP page</a>
+    </div>
+    {% if up.state == "portal" and up.portal_url %}
+      <p class="body-s mt">If the login link has expired, the plain-HTTP page makes the network show its login page again.</p>
+      <p class="body-s mono">{{ up.portal_url }}</p>
     {% endif %}
     <div class="card-actions">
       <form method="post" action="/portal/check" class="inline">{{ csrf_field(csrf) }}

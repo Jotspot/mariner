@@ -41,6 +41,11 @@
     <label class="field"><span>Confirm new password</span><input type="password" name="confirm" minlength="8" required autocomplete="new-password"></label>
     <div class="card-actions"><button class="btn tonal" type="submit">Change password</button></div>
   </form>
+  <form class="card" method="post" action="/logout/everywhere" data-full data-confirm="Sign out of the control panel on every device, including this one?">
+    {{ csrf_field(csrf) }}
+    <p class="body-m">Lost a phone, or signed in on a device that isn't yours? Sign every device out of the control panel. You'll need the password again here too.</p>
+    <div class="card-actions"><button class="btn outlined" type="submit">{{ icon("logout") }}Sign out everywhere</button></div>
+  </form>
 
   <h2 class="title-m section-title">Wi-Fi chip</h2>
   <section class="card" data-live="sys-radio">
@@ -57,10 +62,10 @@
         <p class="body-m"><b>Reboot</b> takes about a minute; your devices reconnect on their own.
           <b>Power off</b> shuts Mariner down safely before you unplug it. To turn it back on, unplug and plug in the power again.</p></div></div>
     <div class="card-actions">
-      <form method="post" action="/system/poweroff" class="inline"
+      <form method="post" action="/system/poweroff" class="inline" data-full
             data-confirm="Power off Mariner? The hotspot and internet stop. To turn it back on, unplug and replug the power.">{{ csrf_field(csrf) }}
         <button class="btn outlined" type="submit">{{ icon("power") }}Power off</button></form>
-      <form method="post" action="/system/reboot" class="inline" data-confirm="Reboot Mariner now?">{{ csrf_field(csrf) }}
+      <form method="post" action="/system/reboot" class="inline" data-full data-confirm="Reboot Mariner now?">{{ csrf_field(csrf) }}
         <button class="btn danger" type="submit">{{ icon("refresh") }}Reboot</button></form>
     </div>
   </section>

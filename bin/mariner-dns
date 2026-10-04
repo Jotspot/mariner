@@ -1,108 +1,221 @@
 #!/usr/bin/env python3
-"""DNS for hotspot clients while the VPN (Geph or Outline) is on.
+"""DNS for hotspot clients whenever Mariner keeps their DNS away from the hotel.
 
-Listens on 10.42.0.1:5354 (UDP and TCP); nftables redirects every port-53
-query from the hotspot here while traffic goes through the VPN. Each query is
-sent as DNS-over-HTTPS through the VPN's SOCKS5 port, so lookups never touch the
-upstream (hotel) network and the VPN exit only sees TLS.
+Listens on 10.42.0.1:5354 (UDP and TCP). While the VPN is on (or the kill
+switch blocks), nftables redirects every port-53 query from the hotspot here.
 
-  - mariner / mariner.local are answered locally with 10.42.0.1.
-  - Answers are cached by question until their smallest TTL expires.
-  - A few keep-alive HTTPS connections are pooled; Cloudflare first, Google
-    as fallback.
+  - The router's own names (hostname, hostname.local) are always answered
+    locally with 10.42.0.1, so the panel stays reachable by name even while
+    the VPN is down or paused for a captive portal.
+  - Everything else goes as DNS-over-HTTPS through the VPN's SOCKS5 port, so
+    lookups never touch the upstream (hotel) network and the VPN exit only sees
+    TLS. If the SOCKS port is closed (VPN stopped), queries are REFUSED at once:
+    nothing ever falls back to the hotel's resolver.
+  - Answers are cached per (name, type, class, DNSSEC-OK bit); TTLs count down
+    while cached.
+  - A pool of keep-alive HTTPS connections; Cloudflare first, Google as fallback.
 
-Stdlib only (asyncio + ssl). Runs as an unprivileged dynamic user.
+"resolv" mode (ExpressVPN, inside its sandbox) sends plain DNS to the
+nameservers in MARINER_DNS_RESOLV instead; the sandbox firewall only lets it
+leave through ExpressVPN's tunnel.
+
+Stdlib only (asyncio + ssl). Runs as an unprivileged user.
 """
 import asyncio
 import ipaddress
 import logging
 import os
+import random
+import socket
 import ssl
 import struct
 import time
 
 LISTEN = (os.environ.get("MARINER_DNS_ADDR", "10.42.0.1"), int(os.environ.get("MARINER_DNS_PORT", "5354")))
-SOCKS = ("127.0.0.1", 9909)
+SOCKS = ("127.0.0.1", int(os.environ.get("MARINER_DNS_SOCKS_PORT", "9909")))
 UPSTREAMS = [
     # (ip to connect to via SOCKS, TLS server name, path)
     ("1.1.1.1", "cloudflare-dns.com", "/dns-query"),
     ("8.8.8.8", "dns.google", "/dns-query"),
 ]
-LOCAL_NAMES = {"mariner", "mariner.local"}
 LOCAL_IP = "10.42.0.1"
-POOL_SIZE = 4
+POOL_SIZE = 12          # parallel DoH connections (each carries one query at a time)
+ATTEMPT_TIMEOUT = 4.0   # per upstream attempt
+QUERY_DEADLINE = 9.0    # whole query, including waiting for a free connection
+TCP_IDLE = 20.0         # close idle client TCP connections
+SOCKS_DOWN_HOLD = 2.0   # after "connection refused", answer REFUSED without retrying for this long
+CACHE_MAX = 5000
 # "doh": DNS-over-HTTPS through the SOCKS port (Geph, Outline).
-# "resolv": plain DNS to the nameservers in MARINER_DNS_RESOLV (ExpressVPN:
-# runs inside its sandbox, where that file holds ExpressVPN's DNS server and
-# the sandbox firewall only lets this service send through the tunnel).
+# "resolv": plain DNS to the nameservers in MARINER_DNS_RESOLV (ExpressVPN).
 UPSTREAM = os.environ.get("MARINER_DNS_UPSTREAM", "doh")
 RESOLV = os.environ.get("MARINER_DNS_RESOLV", "/etc/resolv.conf")
-TIMEOUT = 8.0
+
+RCODE_SERVFAIL, RCODE_REFUSED = 2, 5
 
 log = logging.getLogger("mariner-dns")
 
 
+def local_names():
+    names = [n.strip().lower() for n in os.environ.get("MARINER_DNS_NAMES", "").split(",") if n.strip()]
+    if not names:
+        host = socket.gethostname().split(".")[0].lower() or "mariner"
+        names = [host]
+    out = set()
+    for n in names:
+        out.update({n, f"{n}.local"})
+    return out
+
+
+LOCAL_NAMES = local_names()
+
+
 # --- DNS message helpers -------------------------------------------------------
 
-def parse_question(msg):
-    """Return (qname lowercase, qtype, offset after question) or None."""
-    if len(msg) < 12:
-        return None
-    off, labels = 12, []
-    while off < len(msg):
+def skip_name(msg, off):
+    """Offset just past the (possibly compressed) name starting at off."""
+    while True:
         n = msg[off]
-        off += 1
         if n == 0:
-            break
+            return off + 1
+        if n & 0xC0 == 0xC0:
+            return off + 2
         if n & 0xC0:
+            raise ValueError("bad label")
+        off += 1 + n
+
+
+def parse_query(msg):
+    """The one question plus the client's EDNS settings, or None if malformed.
+
+    Returns dict(name, qtype, qclass, qend, edns) where edns is None or
+    (udp_payload_size, do_bit)."""
+    try:
+        if len(msg) < 12 or msg[2] & 0x80:  # too short, or a response
             return None
-        labels.append(msg[off:off + n].decode("ascii", "replace").lower())
-        off += n
-    if off + 4 > len(msg):
+        qd, an, ns, ar = struct.unpack(">HHHH", msg[4:12])
+        if qd != 1:
+            return None
+        off, labels = 12, []
+        while True:
+            n = msg[off]
+            off += 1
+            if n == 0:
+                break
+            if n & 0xC0:
+                return None
+            labels.append(msg[off:off + n].decode("ascii", "replace").lower())
+            off += n
+        qtype, qclass = struct.unpack(">HH", msg[off:off + 4])
+        qend = off + 4
+        edns = None
+        off = qend
+        for i in range(an + ns + ar):
+            off = skip_name(msg, off)
+            rtype, rclass, ttl, rdlen = struct.unpack(">HHIH", msg[off:off + 10])
+            if rtype == 41 and i >= an + ns:
+                edns = (max(512, rclass), bool(ttl & 0x8000))
+            off += 10 + rdlen
+        return {"name": ".".join(labels), "qtype": qtype, "qclass": qclass, "qend": qend, "edns": edns}
+    except (IndexError, struct.error, ValueError):
         return None
-    qtype, _ = struct.unpack(">HH", msg[off:off + 4])
-    return ".".join(labels), qtype, off + 4
 
 
-def local_answer(query, qtype, qend):
-    """Answer for one of our own names (A only; other types get an empty NOERROR)."""
-    qid = query[:2]
-    flags = 0x8180  # response, RD, RA, NOERROR
-    if qtype == 1:
+def reply_header(query, rcode, an=0):
+    """Response header for query: same id/opcode/RD, RA set, given rcode."""
+    rd = query[2] & 0x01
+    opcode = query[2] & 0x78
+    flags = ((0x80 | opcode | rd) << 8) | 0x80 | rcode
+    return query[:2] + struct.pack(">HHHHH", flags, 1, an, 0, 0)
+
+
+def error_reply(query, q, rcode):
+    return reply_header(query, rcode) + query[12:q["qend"]]
+
+
+def local_answer(query, q):
+    """Our own names: A -> 10.42.0.1; other types get an empty NOERROR."""
+    if q["qtype"] == 1 and q["qclass"] == 1:
         rr = b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 60, 4) + ipaddress.IPv4Address(LOCAL_IP).packed
-        return qid + struct.pack(">HHHHH", flags, 1, 1, 0, 0) + query[12:qend] + rr
-    return qid + struct.pack(">HHHHH", flags, 1, 0, 0, 0) + query[12:qend]
+        return reply_header(query, 0, an=1) + query[12:q["qend"]] + rr
+    return error_reply(query, q, 0)
+
+
+def walk_records(msg):
+    """Yield (offset of TYPE field, rtype) for every resource record."""
+    qd, an, ns, ar = struct.unpack(">HHHH", msg[4:12])
+    off = 12
+    for _ in range(qd):
+        off = skip_name(msg, off) + 4
+    for _ in range(an + ns + ar):
+        off = skip_name(msg, off)
+        rtype, = struct.unpack(">H", msg[off:off + 2])
+        rdlen, = struct.unpack(">H", msg[off + 8:off + 10])
+        yield off, rtype
+        off += 10 + rdlen
 
 
 def min_ttl(msg):
-    """Smallest TTL among answer records (default 60, capped at 1 h)."""
+    """Smallest TTL among the records (OPT excluded); 60 if none, 5 s - 1 h."""
     try:
-        _, qd, an = struct.unpack(">HHH", msg[2:8])
-        off = 12
-
-        def skip(o):
-            while True:
-                n = msg[o]
-                if n == 0:
-                    return o + 1
-                if n & 0xC0 == 0xC0:
-                    return o + 2
-                o += 1 + n
-
-        for _ in range(qd):
-            off = skip(off) + 4
-        ttls = []
-        for _ in range(an):
-            off = skip(off)
-            _t, _c, ttl, rdlen = struct.unpack(">HHIH", msg[off:off + 10])
-            ttls.append(ttl)
-            off += 10 + rdlen
-        return max(5, min(min(ttls) if ttls else 60, 3600))
-    except (struct.error, IndexError):
+        ttls = [struct.unpack(">I", msg[o + 4:o + 8])[0] for o, t in walk_records(msg) if t != 41]
+    except (IndexError, struct.error, ValueError):
         return 30
+    return max(5, min(min(ttls) if ttls else 60, 3600))
+
+
+def age_ttls(msg, elapsed):
+    """The same message with every TTL (OPT excluded) reduced by elapsed seconds."""
+    b = bytearray(msg)
+    try:
+        for o, t in walk_records(msg):
+            if t != 41:
+                ttl, = struct.unpack(">I", b[o + 4:o + 8])
+                struct.pack_into(">I", b, o + 4, max(0, ttl - elapsed))
+    except (IndexError, struct.error, ValueError):
+        return msg
+    return bytes(b)
+
+
+def for_client(query, q, ans):
+    """Upstream/cached answer -> reply to this client: its id and its exact
+    question bytes (keeps 0x20 case randomisation intact)."""
+    try:
+        aq_end = skip_name(ans, 12) + 4
+    except (IndexError, ValueError):
+        return error_reply(query, q, RCODE_SERVFAIL)
+    if ans[12:aq_end].lower() != query[12:q["qend"]].lower():
+        return error_reply(query, q, RCODE_SERVFAIL)
+    return query[:2] + ans[2:12] + query[12:q["qend"]] + ans[aq_end:]
+
+
+def same_question(query, q, ans):
+    """ans answers query's question (never cache a reply meant for another query)."""
+    try:
+        aq_end = skip_name(ans, 12) + 4
+    except (IndexError, ValueError):
+        return False
+    return len(ans) >= 12 and ans[2] & 0x80 and ans[12:aq_end].lower() == query[12:q["qend"]].lower()
+
+
+def fit_udp(ans, q):
+    """Truncate (TC bit, question only) if larger than the client can take over
+    UDP: 512 bytes without EDNS, its advertised size with it."""
+    limit = q["edns"][0] if q["edns"] else 512
+    if len(ans) <= limit:
+        return ans
+    flags, = struct.unpack(">H", ans[2:4])
+    return ans[:2] + struct.pack(">HHHHH", flags | 0x0200, 1, 0, 0, 0) + ans[12:q["qend"]]
+
+
+def rcode(msg):
+    return msg[3] & 0x0F if len(msg) >= 4 else RCODE_SERVFAIL
 
 
 # --- DoH over SOCKS5 -------------------------------------------------------------
+
+class SocksRefused(OSError):
+    """The SOCKS port is closed: the VPN client isn't running."""
+
 
 class DohConn:
     def __init__(self, upstream):
@@ -110,21 +223,28 @@ class DohConn:
         self.reader = self.writer = None
 
     async def connect(self):
-        r, w = await asyncio.open_connection(*SOCKS)
-        w.write(b"\x05\x01\x00")
-        await w.drain()
-        if await r.readexactly(2) != b"\x05\x00":
-            raise OSError("SOCKS auth refused")
-        w.write(b"\x05\x01\x00\x01" + ipaddress.IPv4Address(self.ip).packed + struct.pack(">H", 443))
-        await w.drain()
-        rep = await r.readexactly(4)
-        if rep[1] != 0:
-            raise OSError(f"SOCKS connect failed ({rep[1]})")
-        alen = {1: 4, 4: 16}.get(rep[3])
-        if alen is None:
-            alen = (await r.readexactly(1))[0]
-        await r.readexactly(alen + 2)
-        await w.start_tls(ssl.create_default_context(), server_hostname=self.host)
+        try:
+            r, w = await asyncio.open_connection(*SOCKS)
+        except ConnectionRefusedError as e:
+            raise SocksRefused(str(e)) from None
+        try:
+            w.write(b"\x05\x01\x00")
+            await w.drain()
+            if await r.readexactly(2) != b"\x05\x00":
+                raise OSError("SOCKS auth refused")
+            w.write(b"\x05\x01\x00\x01" + ipaddress.IPv4Address(self.ip).packed + struct.pack(">H", 443))
+            await w.drain()
+            rep = await r.readexactly(4)
+            if rep[1] != 0:
+                raise OSError(f"SOCKS connect failed ({rep[1]})")
+            alen = {1: 4, 4: 16}.get(rep[3])
+            if alen is None:
+                alen = (await r.readexactly(1))[0]
+            await r.readexactly(alen + 2)
+            await w.start_tls(ssl.create_default_context(), server_hostname=self.host)
+        except BaseException:
+            w.close()
+            raise
         self.reader, self.writer = r, w
 
     async def query(self, msg):
@@ -141,7 +261,10 @@ class DohConn:
         headers = {k.strip().lower(): v.strip() for k, _, v in (l.partition(":") for l in lines[1:] if l)}
         if "content-length" not in headers:
             raise OSError("DoH reply without Content-Length")
-        body = await self.reader.readexactly(int(headers["content-length"]))
+        length = int(headers["content-length"])
+        if not 12 <= length <= 65535:
+            raise OSError("DoH reply with a bad length")
+        body = await self.reader.readexactly(length)
         if headers.get("connection", "").lower() == "close":
             self.close()
         if status != 200:
@@ -173,8 +296,6 @@ def resolv_servers():
 
 def plain_query(body):
     """Plain DNS (UDP, TCP if truncated) to the resolv.conf nameservers. Blocking."""
-    import random
-    import socket
     for server in resolv_servers():
         qid = random.randint(0, 0xFFFF).to_bytes(2, "big")
         msg = qid + body
@@ -182,13 +303,14 @@ def plain_query(body):
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
                 s.settimeout(3)
                 s.sendto(msg, (server, 53))
-                ans, _ = s.recvfrom(4096)
+                ans, _ = s.recvfrom(65535)
             if ans[:2] != qid:
                 continue
             if ans[2] & 0x02:  # TC: retry over TCP
                 with socket.create_connection((server, 53), timeout=5) as t:
                     t.sendall(struct.pack(">H", len(msg)) + msg)
-                    n = struct.unpack(">H", t.recv(2))[0]
+                    hdr = t.recv(2)
+                    n = struct.unpack(">H", hdr)[0]
                     ans = b""
                     while len(ans) < n:
                         chunk = t.recv(n - len(ans))
@@ -196,7 +318,7 @@ def plain_query(body):
                             break
                         ans += chunk
             return ans
-        except OSError as e:
+        except (OSError, struct.error) as e:
             log.warning("DNS via %s failed: %s", server, e)
     return None
 
@@ -204,51 +326,88 @@ def plain_query(body):
 class Resolver:
     def __init__(self):
         self.pool = asyncio.Queue()
-        for i in range(POOL_SIZE):
+        for _ in range(POOL_SIZE):
             self.pool.put_nowait([DohConn(UPSTREAMS[0])])
         self.cache = {}
+        self.socks_down_until = 0.0
+
+    def cache_get(self, key):
+        hit = self.cache.get(key)
+        if not hit:
+            return None
+        expires, stored, ans = hit
+        now = time.monotonic()
+        if expires <= now:
+            del self.cache[key]
+            return None
+        return age_ttls(ans, int(now - stored))
+
+    def cache_put(self, key, ans):
+        if rcode(ans) not in (0, 3):  # NOERROR / NXDOMAIN only
+            return
+        if len(self.cache) >= CACHE_MAX:
+            self.cache.clear()
+        now = time.monotonic()
+        self.cache[key] = (now + min_ttl(ans), now, ans)
 
     async def resolve(self, query):
-        q = parse_question(query)
+        """Answer bytes for query (without UDP size limits), or None to drop it."""
+        q = parse_query(query)
         if q is None:
             return None
-        name, qtype, qend = q
-        if name in LOCAL_NAMES:
-            return local_answer(query, qtype, qend)
-        key = query[2:]  # everything but the id
-        hit = self.cache.get(key)
-        if hit and hit[0] > time.monotonic():
-            return query[:2] + hit[1][2:]
+        if q["name"] in LOCAL_NAMES:
+            return local_answer(query, q)
+        key = (q["name"], q["qtype"], q["qclass"], bool(q["edns"] and q["edns"][1]))
+        cached = self.cache_get(key)
+        if cached:
+            return for_client(query, q, cached)
         if UPSTREAM == "resolv":
             ans = await asyncio.to_thread(plain_query, query[2:])
-            if ans is None:
-                return query[:2] + struct.pack(">H", 0x8182) + query[4:6] + b"\0\0\0\0\0\0" + query[12:qend]
-            if len(self.cache) > 5000:
-                self.cache.clear()
-            self.cache[key] = (time.monotonic() + min_ttl(ans), ans)
-            return query[:2] + ans[2:]
+        else:
+            try:
+                ans = await asyncio.wait_for(self.doh(query, q), QUERY_DEADLINE)
+            except asyncio.TimeoutError:
+                ans = None
+            except SocksRefused:
+                return error_reply(query, q, RCODE_REFUSED)
+        if ans is None or not same_question(query, q, ans):
+            return error_reply(query, q, RCODE_SERVFAIL)
+        self.cache_put(key, ans)
+        return for_client(query, q, ans)
+
+    async def doh(self, query, q):
+        if self.socks_down_until > time.monotonic():
+            raise SocksRefused("VPN not running")
         slot = await self.pool.get()
+        done = False  # False if cancelled/failed mid-request: the connection may hold an unread reply
         try:
             for upstream in UPSTREAMS:
-                conn = slot[0]
-                if (conn.ip, conn.host, conn.path) != upstream:
-                    conn.close()
-                    conn = slot[0] = DohConn(upstream)
-                for attempt in range(2):  # retry once on a stale keep-alive connection
+                if (slot[0].ip, slot[0].host, slot[0].path) != upstream:
+                    slot[0].close()
+                    slot[0] = DohConn(upstream)
+                for _attempt in range(2):  # retry once on a stale keep-alive connection
+                    conn = slot[0]
+                    fresh = conn.writer is None
                     try:
-                        ans = await asyncio.wait_for(conn.query(b"\0\0" + query[2:]), TIMEOUT)
-                        if len(self.cache) > 5000:
-                            self.cache.clear()
-                        self.cache[key] = (time.monotonic() + min_ttl(ans), ans)
+                        ans = await asyncio.wait_for(conn.query(b"\0\0" + query[2:]), ATTEMPT_TIMEOUT)
                         if upstream is not UPSTREAMS[0]:
                             slot[0].close()
                             slot[0] = DohConn(UPSTREAMS[0])
-                        return query[:2] + ans[2:]
+                        done = True
+                        return ans
+                    except SocksRefused:
+                        self.socks_down_until = time.monotonic() + SOCKS_DOWN_HOLD
+                        raise
                     except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError, IndexError) as e:
                         conn.close()
-                        log.warning("%s via %s failed: %s", name, upstream[1], e or type(e).__name__)
-            return query[:2] + struct.pack(">H", 0x8182) + query[4:6] + b"\0\0\0\0\0\0" + query[12:qend]  # SERVFAIL
+                        log.warning("%s via %s failed: %s", q["name"], upstream[1], e or type(e).__name__)
+                        if fresh:
+                            break  # a brand-new connection failed: no point retrying the same upstream
+            done = True
+            return None
         finally:
+            if not done:
+                slot[0].close()  # never hand on a connection with a request in flight
             self.pool.put_nowait(slot)
 
 
@@ -263,36 +422,58 @@ class UdpServer(asyncio.DatagramProtocol):
         asyncio.ensure_future(self.answer(data, addr))
 
     async def answer(self, data, addr):
-        ans = await self.resolver.resolve(data)
+        try:
+            ans = await self.resolver.resolve(data)
+        except Exception:  # never let one bad packet kill the task silently
+            log.exception("query failed")
+            return
         if ans:
-            self.transport.sendto(ans, addr)
+            q = parse_query(data)
+            self.transport.sendto(fit_udp(ans, q) if q else ans, addr)
 
 
 async def tcp_client(reader, writer, resolver):
     try:
         while True:
-            n = struct.unpack(">H", await reader.readexactly(2))[0]
-            ans = await resolver.resolve(await reader.readexactly(n))
+            hdr = await asyncio.wait_for(reader.readexactly(2), TCP_IDLE)
+            n = struct.unpack(">H", hdr)[0]
+            query = await asyncio.wait_for(reader.readexactly(n), TCP_IDLE)
+            ans = await resolver.resolve(query)
             if not ans:
                 break
             writer.write(struct.pack(">H", len(ans)) + ans)
             await writer.drain()
-    except (asyncio.IncompleteReadError, OSError):
+    except (asyncio.IncompleteReadError, asyncio.TimeoutError, OSError):
         pass
+    except Exception:
+        log.exception("TCP client failed")
     finally:
         writer.close()
+
+
+def bound_socket(kind):
+    """Listening socket that may bind before the hotspot address exists (IP_FREEBIND)."""
+    s = socket.socket(socket.AF_INET, kind)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.setsockopt(socket.IPPROTO_IP, getattr(socket, "IP_FREEBIND", 15), 1)
+    s.bind(LISTEN)
+    if kind == socket.SOCK_STREAM:
+        s.listen(64)
+    s.setblocking(False)
+    return s
 
 
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     resolver = Resolver()
     loop = asyncio.get_running_loop()
-    await loop.create_datagram_endpoint(lambda: UdpServer(resolver), local_addr=LISTEN)
-    server = await asyncio.start_server(lambda r, w: tcp_client(r, w, resolver), *LISTEN)
+    await loop.create_datagram_endpoint(lambda: UdpServer(resolver), sock=bound_socket(socket.SOCK_DGRAM))
+    server = await asyncio.start_server(lambda r, w: tcp_client(r, w, resolver), sock=bound_socket(socket.SOCK_STREAM))
+    names = ", ".join(sorted(LOCAL_NAMES))
     if UPSTREAM == "resolv":
-        log.info("listening on %s:%d, plain DNS to nameservers in %s", *LISTEN, RESOLV)
+        log.info("listening on %s:%d (local names: %s), plain DNS to nameservers in %s", *LISTEN, names, RESOLV)
     else:
-        log.info("listening on %s:%d, DoH via SOCKS %s:%d", *LISTEN, *SOCKS)
+        log.info("listening on %s:%d (local names: %s), DoH via SOCKS %s:%d", *LISTEN, names, *SOCKS)
     async with server:
         await server.serve_forever()
 

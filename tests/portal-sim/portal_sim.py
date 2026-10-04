@@ -727,6 +727,40 @@ def run_scenario(sc_):
     return res
 
 
+# uplink_info(): which NetworkManager device states count as "probe now".
+# (state line, IPv4 address line, expected connected)
+UPLINK_STATES = [
+    ("100 (connected)", "10.10.3.77/22", True),
+    ("100 (connected)", "", True),                 # activated: probe (fails -> offline) even without IPv4
+    ("70 (connecting (getting IP configuration))", "", False),
+    ("70 (connecting (getting IP configuration))", "10.10.3.77/22", True),   # IPv4 up, waiting for IPv6
+    ("80 (connecting (checking IP connectivity))", "10.10.3.77/22", True),
+    ("50 (connecting (configuring))", "", False),
+    ("30 (disconnected)", "", False),
+    ("", "", False),
+]
+
+
+def uplink_state_checks():
+    """Unit checks for uplink_info()'s NM state handling; returns failures."""
+    fails = []
+    for state, addr, want in UPLINK_STATES:
+        mod = load_check("uplink")
+
+        def fake_run(*cmd, state=state, addr=addr):
+            if "GENERAL.STATE" in cmd:
+                return state
+            if "IP4.ADDRESS" in cmd:
+                return addr
+            return ""
+        mod.run = fake_run
+        got = mod.uplink_info()[0]
+        print(f"U     {'PASS' if got == want else 'FAIL':6} uplink_info({state!r}, ipv4={addr!r}) -> connected={got}")
+        if got != want:
+            fails.append(state)
+    return fails
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("-k", help="only these scenarios: ids (exact) or words in group/description; space/comma separated")
@@ -758,7 +792,9 @@ def main():
             for x in r["runs"]:
                 for p in x.get("probes", []):
                     print(f"{'':52}   {p}")
+    ufails = uplink_state_checks() if not terms else []
     n = {k: sum(r["status"] == k for r in results) for k in ("PASS", "WARN", "FAIL")}
+    n["FAIL"] += len(ufails)
     print(f"\n{len(results)} scenarios: {n['PASS']} pass, {n['WARN']} warn (url/slow), {n['FAIL']} fail "
           f"[{time.monotonic() - t0:.0f}s wall]")
     if args.json:
