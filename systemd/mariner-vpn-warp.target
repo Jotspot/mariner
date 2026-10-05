@@ -1,0 +1,5 @@
+[Unit]
+Description=Mariner: hotspot traffic through Cloudflare WARP (sandboxed official app)
+# Started and stopped only by `mariner-ctl reconcile`; never enabled directly.
+Wants=mariner-warp-netns.service warp-svc.service mariner-warp-dns.service
+Conflicts=mariner-vpn-geph.target mariner-vpn-outline.target mariner-vpn-expressvpn.target

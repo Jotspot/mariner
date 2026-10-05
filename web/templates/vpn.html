@@ -41,7 +41,7 @@
     <form method="post" action="/vpn/provider">
       {{ csrf_field(csrf) }}
       <div class="segmented" role="radiogroup" aria-label="VPN service">
-        {% for key, label in [("geph", "Geph"), ("outline", "Outline"), ("expressvpn", "ExpressVPN")] %}
+        {% for key, label in [("geph", "Geph"), ("outline", "Outline"), ("expressvpn", "ExpressVPN"), ("warp", "WARP")] %}
         <button type="submit" name="provider" value="{{ key }}" class="seg {{ 'on' if v.provider == key }}"
                 aria-pressed="{{ 'true' if v.provider == key else 'false' }}">{{ label }}{% if not v.configured[key] %} <span class="seg-note">not set up</span>{% endif %}</button>
         {% endfor %}
@@ -146,6 +146,47 @@
       </form>
     {% if v.outline %}</details>{% endif %}
   </section>
+{% elif v.provider == "warp" %}
+  {% set w = v.warp %}
+  <h2 class="title-m section-title">Cloudflare WARP</h2>
+  <section class="card">
+    {% if not w.installed %}
+      <p class="body-m">Cloudflare's WARP app isn't installed on this Mariner yet. It's added from a computer over SSH (connect by ethernet or to this hotspot), not from this panel:</p>
+      <code class="cmd">ssh {{ ssh_user }}@{{ hostname }}.local</code>
+      <code class="cmd">curl -fsSL https://raw.githubusercontent.com/Jotspot/mariner/main/bootstrap.sh | sudo bash -s -- --add-warp</code>
+      <p class="body-s mt">It comes from Cloudflare's own package repository (about 1 GB with its dependencies). Nothing else changes. Details: <a href="https://github.com/Jotspot/mariner#cloudflare-warp" target="_blank" rel="noopener noreferrer">WARP in the README</a>.</p>
+    {% elif w.registered %}
+      <div class="card-head top">
+        <div class="avatar">{{ icon("key") }}</div>
+        <div class="grow"><p class="title-m">Registered (free WARP)</p>
+          <p class="body-m">Cloudflare's official WARP app runs sealed off in its own network sandbox on the Pi. WARP has no locations to pick: you come out at a nearby Cloudflare data centre.</p></div>
+      </div>
+      <form method="post" action="/vpn/warp/unregister" data-confirm="Remove this Mariner's WARP registration?">
+        {{ csrf_field(csrf) }}
+        <div class="card-actions"><button class="btn text" type="submit" data-busy="Removing…">{{ icon("logout") }}Unregister</button></div>
+      </form>
+    {% else %}
+      <form method="post" action="/vpn/warp/register">
+        {{ csrf_field(csrf) }}
+        <p class="body-m">Register this Mariner with Cloudflare's free WARP service. No account needed.</p>
+        <p class="body-s mt">By registering you accept Cloudflare's <a href="https://www.cloudflare.com/application/terms/" target="_blank" rel="noopener noreferrer">WARP terms of service</a>.</p>
+        <div class="card-actions"><button class="btn filled" type="submit" data-busy="Registering…">Register</button></div>
+      </form>
+    {% endif %}
+  </section>
+
+  {% if w.installed and w.registered %}
+  <h2 class="title-m section-title">Protocol</h2>
+  <form class="card" method="post" action="/vpn/warp/settings">
+    {{ csrf_field(csrf) }}
+    <div class="segmented" role="radiogroup" aria-label="WARP protocol">
+      <label><input type="radio" name="protocol" value="masque" {{ "checked" if w.protocol == "masque" }}><span>MASQUE</span></label>
+      <label><input type="radio" name="protocol" value="wireguard" {{ "checked" if w.protocol == "wireguard" }}><span>WireGuard</span></label>
+    </div>
+    <p class="body-s mt"><b>MASQUE</b> (default) travels as ordinary HTTPS (HTTP/3), so it gets through more networks. <b>WireGuard</b> is often a little faster, but easier to spot and block.</p>
+    <div class="card-actions"><button class="btn filled" type="submit" data-busy="Saving…">Save &amp; reconnect</button></div>
+  </form>
+  {% endif %}
 {% else %}
   {% set e = v.expressvpn %}
   <h2 class="title-m section-title">ExpressVPN account</h2>

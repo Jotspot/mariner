@@ -73,14 +73,31 @@ PROVIDERS = {
                    "target": "mariner-vpn-expressvpn.target"},
     "geph": {"name": "Geph", "service": "geph5.service", "target": "mariner-vpn-geph.target"},
     "outline": {"name": "Outline", "service": "outline-ss.service", "target": "mariner-vpn-outline.target"},
+    "warp": {"name": "Cloudflare WARP", "service": "warp-svc.service", "target": "mariner-vpn-warp.target"},
 }
 VPN_DEFAULTS = {"enabled": False, "provider": "geph", "killswitch": True,
                 "geph": {"exit": "auto", "credentials": None}, "outline": None,
-                "expressvpn": {"signed_in": False, "region": "smart", "protocol": "wireguard"}}
+                "expressvpn": {"signed_in": False, "region": "smart", "protocol": "wireguard"},
+                "warp": {"registered": False, "protocol": "masque"}}
 
 # ExpressVPN sandbox (bin/mariner-evpn-netns)
 EVPN_CTL = "/opt/expressvpn/bin/expressvpnctl"
 EVPN_NS, EVPN_HOST_IF, EVPN_NS_IP = "evpn", "evh", "10.200.0.2"
+
+# Sandboxed VPN apps (bin/mariner-sandbox-netns): the namespace, the host end
+# of its veth, the namespace's address (next hop for hotspot traffic and its
+# DNS forwarder), the /30 between them, and the app's tunnel interfaces.
+SANDBOX = {
+    "expressvpn": {"ns": "evpn", "host_if": "evh", "ns_ip": "10.200.0.2", "net": "10.200.0.0/30",
+                   "tun": r"^(wgexpressvpn\S*|tun\d+)\s"},
+    "warp": {"ns": "warp", "host_if": "wph", "ns_ip": "10.200.0.6", "net": "10.200.0.4/30",
+             "tun": r"^(CloudflareWARP)\s"},
+}
+
+# Cloudflare WARP (official app, in the "warp" sandbox)
+WARP_CLI = "/usr/bin/warp-cli"
+WARP_PROTOCOLS = {"masque": "MASQUE", "wireguard": "WireGuard"}
+WARP_CONFIGURED = "/run/mariner/warp-configured"   # daemon InvocationID the settings were applied to
 EVPN_REGIONS = "/var/lib/mariner/evpn-regions.json"
 # Lightway is offered but crawls on the Pi 4 (one core at 100% for ~1 Mbit/s).
 EVPN_PROTOCOLS = ("wireguard", "openvpnudp", "openvpntcp", "lightwayudp", "lightwaytcp", "auto")
@@ -283,6 +300,7 @@ def vpn_cfg():
     merged.update(cfg or {})
     merged["geph"] = {**VPN_DEFAULTS["geph"], **(merged.get("geph") or {})}
     merged["expressvpn"] = {**VPN_DEFAULTS["expressvpn"], **(merged.get("expressvpn") or {})}
+    merged["warp"] = {**VPN_DEFAULTS["warp"], **(merged.get("warp") or {})}
     if merged["provider"] not in PROVIDERS:
         merged["provider"] = "geph"
     return merged
@@ -293,6 +311,8 @@ def configured(cfg, provider):
         return bool(cfg["geph"].get("credentials"))
     if provider == "expressvpn":
         return bool(cfg["expressvpn"].get("signed_in")) and os.path.exists(EVPN_CTL)
+    if provider == "warp":
+        return bool(cfg["warp"].get("registered")) and os.path.exists(WARP_CLI)
     return bool((cfg.get("outline") or {}).get("server"))
 
 
@@ -589,10 +609,17 @@ def evpn_state():
     return evpn_info()["state"]
 
 
+def sandbox_tunnel_present(provider):
+    """The sandboxed app's tunnel interface exists inside its namespace."""
+    sb = SANDBOX[provider]
+    if not os.path.exists(f"/run/netns/{sb['ns']}"):
+        return False
+    links = sh("nsenter", f"--net=/run/netns/{sb['ns']}", "ip", "-br", "link", check=False)  # no /sys remount
+    return bool(re.search(sb["tun"], links, re.M))
+
+
 def evpn_tunnel_present():
-    """ExpressVPN's tunnel interface exists inside the sandbox."""
-    links = sh("nsenter", f"--net=/run/netns/{EVPN_NS}", "ip", "-br", "link", check=False)  # no /sys remount
-    return bool(re.search(r"^(wgexpressvpn\S*|tun\d+)\s", links, re.M))
+    return sandbox_tunnel_present("expressvpn")
 
 
 def evpn_logged_in():
@@ -662,15 +689,131 @@ def evpn_settled(info, sw):
 
 
 def cmd_evpn_settle(args):
-    """Wait (up to 90 s) for ExpressVPN to finish connecting, then reconcile once."""
+    """Wait (up to 90 s) for the sandboxed app to finish connecting, then
+    reconcile once (routing/DNS switch to its tunnel only in a reconcile that
+    sees it up)."""
+    provider = vpn_cfg()["provider"]
     for _ in range(45):
         time.sleep(2)
+        if provider == "warp":
+            if warp_info()["state"] == "Connected" and sandbox_tunnel_present("warp"):
+                break
+            continue
         info = evpn_info(max_age=0)
         if info["state"] == "Connected" and evpn_tunnel_present():
             break
         if not evpn_switching():
             break
-    return reconcile()
+    state = reconcile()
+    try:
+        vpn_probe(force=True, count_fail=False)  # the exit (flag) shows right away too
+    except (Fail, OSError, subprocess.TimeoutExpired):
+        pass
+    return state
+
+
+def warp(*args, timeout=15):
+    """Run warp-cli (it talks to the sandboxed daemon over its socket).
+    --accept-tos: the terms were accepted when the user registered in the
+    panel; nothing calls this for WARP before that."""
+    if not os.path.exists(WARP_CLI):
+        raise Fail("Cloudflare WARP isn't installed on this Mariner")
+    return sh(WARP_CLI, "--accept-tos", *args, check=False, timeout=timeout)
+
+
+def warp_ok(*args, timeout=15):
+    try:
+        p = subprocess.run([WARP_CLI, "--accept-tos", *args], capture_output=True, text=True, timeout=timeout + 10)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return p.returncode == 0
+
+
+def warp_info():
+    """{"state": Connected|Connecting|Disconnected|Unable|Unknown, "reason": ...}."""
+    try:
+        d = json.loads(warp("-j", "status", timeout=8) or "{}")
+    except (ValueError, Fail, subprocess.TimeoutExpired):
+        d = {}
+    if not isinstance(d, dict):
+        d = {}
+    reason = d.get("reason")
+    return {"state": str(d.get("status") or "Unknown"), "reason": reason,
+            "registered": "RegistrationMissing" not in json.dumps(reason or "")}
+
+
+def warp_daemon_up(wait=30):
+    """Start warp-svc (in its sandbox) if needed and wait until it answers."""
+    if not unit_active("warp-svc.service"):
+        sh("systemctl", "start", "warp-svc.service", timeout=60)
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if warp_info()["state"] != "Unknown":
+            return True
+        time.sleep(1)
+    return False
+
+
+def warp_configure(cfg, force=False):
+    """Once per daemon start: tunnel only (Mariner's forwarder does DNS, through
+    the tunnel) and the chosen protocol."""
+    inv = unit_prop("warp-svc.service", "InvocationID")
+    try:
+        done = open(WARP_CONFIGURED).read().strip() == inv
+    except OSError:
+        done = False
+    if done and not force:
+        return
+    ok = warp_ok("mode", "tunnel_only") and warp_ok("tunnel", "protocol", "set",
+                                                     WARP_PROTOCOLS[cfg["warp"]["protocol"]])
+    if ok:
+        with open(WARP_CONFIGURED, "w") as f:
+            f.write(inv)
+    else:
+        subprocess.run(["logger", "-t", "mariner-ctl", "WARP: settings not applied yet"], check=False)
+
+
+def cmd_warp_register(args):
+    """Register this Mariner with Cloudflare's free WARP service. The user
+    accepted Cloudflare's terms by tapping Register in the panel."""
+    if not os.path.exists(WARP_CLI):
+        raise Fail("Cloudflare WARP isn't installed on this Mariner")
+    busy = f"{RUN}/warp-busy"  # keeps reconcile from stopping the daemon meanwhile
+    open(busy, "w").close()
+    try:
+        sh("systemctl", "start", "mariner-warp-netns.service", timeout=30)
+        reconcile(units=False, wait=True)  # NAT for the sandbox, so the daemon can reach Cloudflare
+        if not warp_daemon_up():
+            raise Fail("the WARP app isn't answering")
+        if not warp_info()["registered"]:
+            out = warp("registration", "new", timeout=60)
+            if not warp_info()["registered"]:
+                raise Fail("Cloudflare didn't accept the registration: " + clean(out.strip().splitlines()[-1]
+                                                                              if out.strip() else "no answer", 160))
+        with cfg_lock():
+            cfg = vpn_cfg()
+            cfg["warp"]["registered"] = True
+            write_json(VPN_JSON, cfg)
+        warp_configure(cfg, force=True)
+        subprocess.run(["logger", "-t", "mariner-ctl", "WARP: registered"], check=False)
+    finally:
+        os.remove(busy)
+    reconcile()
+    return vpn_status()
+
+
+def cmd_warp_unregister(args):
+    if unit_active("warp-svc.service"):
+        warp("disconnect", timeout=20)
+        warp("registration", "delete", timeout=30)
+    with cfg_lock():
+        cfg = vpn_cfg()
+        cfg["warp"]["registered"] = False
+        if cfg["provider"] == "warp":
+            cfg["enabled"] = False
+        write_json(VPN_JSON, cfg)
+    reconcile()
+    return vpn_status()
 
 
 def evpn_refresh_regions():
@@ -743,10 +886,10 @@ def hotspot_ifs():
 
 def tunnel_dev(provider):
     """Where hotspot traffic is routed while the VPN is on."""
-    return EVPN_HOST_IF if provider == "expressvpn" else TUN_IF
+    return SANDBOX[provider]["host_if"] if provider in SANDBOX else TUN_IF
 
 
-def nft_ruleset(block, dns_tunnel, provider="geph", evpn_dns=False, allow_ips=()):
+def nft_ruleset(block, dns_tunnel, provider="geph", sandbox_dns=False, allow_ips=()):
     """The whole `inet mariner` table.
 
     block: kill switch (hotspot traffic may only leave through the tunnel).
@@ -764,7 +907,12 @@ def nft_ruleset(block, dns_tunnel, provider="geph", evpn_dns=False, allow_ips=()
             forward += f'        ip saddr {{ {allow} }} counter accept comment "login window"\n'
         forward += (f'        iifname {{ {hs} }} oifname != {{ {hs}, "{tunnel_dev(provider)}" }} '
                     'counter drop comment "killswitch"\n')
-    dns_to = f"{EVPN_NS_IP}:5354" if evpn_dns else "10.42.0.1:5354"
+    dns_to = f"{SANDBOX[provider]['ns_ip']}:5354" if sandbox_dns and provider in SANDBOX else "10.42.0.1:5354"
+    guards = "".join(
+        f'        iifname "{sb["host_if"]}" ip saddr != {sb["ns_ip"]} oifname != {{ {hs} }} '
+        f'counter drop comment "{sb["ns"]} guard"\n' for sb in SANDBOX.values())
+    sandbox_nat = "".join(
+        f'        ip saddr {sb["net"]} oifname != "{sb["host_if"]}" masquerade\n' for sb in SANDBOX.values())
     stale_dns = ""
     if dns_tunnel:
         # New port-53 flows are DNATed to 5354 before they get here; packets of
@@ -802,18 +950,17 @@ table inet mariner {{
         type filter hook forward priority filter - 10; policy accept;
         # The hotspot is IPv4-only; never forward its IPv6.
         iifname {{ {hs} }} meta nfproto ipv6 drop
-        # ExpressVPN sandbox: only its own VPN connection (10.200.0.2) may come
-        # back out of it towards the internet; hotspot traffic it failed to
-        # tunnel may only return to the hotspot. Always on.
-        iifname "{EVPN_HOST_IF}" ip saddr != {EVPN_NS_IP} oifname != {{ {hs} }} counter drop comment "evpn guard"
-{forward}    }}
+        # VPN app sandboxes: only the app's own connection (from the sandbox's
+        # address) may come back out towards the internet; hotspot traffic it
+        # failed to tunnel may only return to the hotspot. Always on.
+{guards}{forward}    }}
     chain prerouting {{
         type nat hook prerouting priority dstnat - 10; policy accept;
 {nat}    }}
     chain postrouting {{
         type nat hook postrouting priority srcnat - 10; policy accept;
-        # The ExpressVPN sandbox's own traffic (its VPN connection) goes out via the uplink.
-        ip saddr 10.200.0.0/30 oifname != "{EVPN_HOST_IF}" masquerade
+        # The sandboxes' own traffic (the apps' VPN connections) goes out via the uplink.
+{sandbox_nat}
     }}
 }}
 """
@@ -849,7 +996,7 @@ def apply_routing(route_tunnel, provider="geph", allow_ips=()):
         sh("ip", "route", "replace", HOTSPOT_NET, "dev", HOTSPOT_IF, "table", TABLE, check=False)
     dev = tunnel_dev(provider)
     if link_exists(dev):
-        via = ["via", EVPN_NS_IP] if provider == "expressvpn" else []
+        via = ["via", SANDBOX[provider]["ns_ip"]] if provider in SANDBOX else []
         sh("ip", "route", "replace", "default", *via, "dev", dev, "metric", "10", "table", TABLE, check=False)
     else:
         sh("ip", "route", "del", "default", "metric", "10", "table", TABLE, check=False)
@@ -891,10 +1038,10 @@ def reconcile(units=True, wait=False):
     # slow or failing service handling (also covers boot, where nothing else
     # has created the firewall yet).
     if block:
-        evpn_dns = (provider == "expressvpn" and want_run and link_exists(EVPN_HOST_IF)
-                    and evpn_tunnel_present())
+        sandbox_dns = (provider in SANDBOX and want_run and link_exists(SANDBOX[provider]["host_if"])
+                       and sandbox_tunnel_present(provider))
         apply_routing(True, provider, allow_ips)
-        sh("nft", "-f", "-", input=nft_ruleset(True, True, provider, evpn_dns, allow_ips))
+        sh("nft", "-f", "-", input=nft_ruleset(True, True, provider, sandbox_dns, allow_ips))
 
     unit_error = None
     try:
@@ -906,6 +1053,9 @@ def reconcile(units=True, wait=False):
 
     if provider == "expressvpn":
         tun_up = (link_exists(EVPN_HOST_IF) and evpn_state() == "Connected" and evpn_tunnel_present()
+                  if want_run else False)
+    elif provider == "warp":
+        tun_up = (link_exists("wph") and warp_info()["state"] == "Connected" and sandbox_tunnel_present("warp")
                   if want_run else False)
     else:
         tun_up = link_exists(TUN_IF)
@@ -922,7 +1072,7 @@ def reconcile(units=True, wait=False):
 
     apply_routing(route_tunnel, provider, allow_ips)
     sh("nft", "-f", "-", input=nft_ruleset(block, dns_tunnel, provider,
-                                           provider == "expressvpn" and tun_up, allow_ips))
+                                           provider in SANDBOX and tun_up, allow_ips))
     state = reconcile_state(cfg, provider, portal, has_creds, block, route_tunnel, dns_tunnel, tun_up, win, works)
     if unit_error and units:
         raise Fail(str(unit_error))
@@ -937,7 +1087,7 @@ def reconcile_units(cfg, provider, want_run):
         # daemon running, disconnected: the daemon takes ~15 s to stop and
         # ~20 s to start, a connect only a few. It lives in its own network
         # namespace, so idling there routes nothing.
-        keep = name == "expressvpn" and name == provider
+        keep = name in SANDBOX and name == provider
         if (not want_run or name != provider) and not keep and unit_active(p["target"]):
             sh("systemctl", "stop", p["target"], timeout=90)
             if name == "expressvpn":
@@ -956,10 +1106,39 @@ def reconcile_units(cfg, provider, want_run):
             evpn("disconnect", timeout=20, check=False)
             if os.path.exists(EVPN_INFO):
                 os.remove(EVPN_INFO)
+    # Cloudflare WARP: the same arrangement as ExpressVPN above.
+    if provider != "warp":
+        if unit_active("warp-svc.service") and not os.path.exists(f"{RUN}/warp-busy"):
+            sh("systemctl", "stop", "warp-svc.service", timeout=60, check=False)
+            if os.path.exists(WARP_CONFIGURED):
+                os.remove(WARP_CONFIGURED)
+    elif not want_run and unit_active("warp-svc.service") and not os.path.exists(f"{RUN}/warp-busy"):
+        if warp_info()["state"] not in ("Disconnected", "Unknown", "Unable"):
+            subprocess.run(["logger", "-t", "mariner-ctl", "WARP: disconnecting (VPN off)"], check=False)
+            warp("disconnect", timeout=20)
     target = PROVIDERS[provider]["target"]
     if want_run and not unit_active(target):
         write_provider_conf(cfg)
         sh("systemctl", "start", target, timeout=90)
+    if want_run and provider == "warp":
+        if not warp_daemon_up():
+            raise Fail("the WARP app isn't answering yet")
+        info = warp_info()
+        if not info["registered"]:
+            with cfg_lock():
+                fresh = vpn_cfg()
+                fresh["warp"]["registered"] = False
+                write_json(VPN_JSON, fresh)
+            subprocess.run(["logger", "-t", "mariner-ctl", "WARP isn't registered; register again on the VPN page"])
+        else:
+            warp_configure(cfg)
+            if info["state"] in ("Disconnected", "Unable"):
+                subprocess.run(["logger", "-t", "mariner-ctl",
+                                f"WARP: connecting ({WARP_PROTOCOLS[cfg['warp']['protocol']]})"], check=False)
+                warp("connect", timeout=15)
+                sh("systemd-run", "--quiet", "--collect", "-p", "StandardOutput=null", "--unit",
+                   unit_name("mariner-warp-settle"), "/usr/local/lib/mariner/bin/mariner-ctl", "evpn-settle",
+                   check=False)
     if want_run and provider == "expressvpn":
         if not evpn_daemon_up():  # the target returns before the daemon answers
             raise Fail("the ExpressVPN app isn't answering yet")
@@ -993,7 +1172,7 @@ def tunnel_works(provider, tun_up):
     """The VPN carries traffic now (not just: its tunnel interface exists)."""
     if not tun_up:
         return False
-    if provider == "expressvpn":
+    if provider in SANDBOX:
         return True  # tun_up already means Connected with the tunnel present
     if provider == "geph":
         try:
@@ -1071,8 +1250,10 @@ def geo_lookup(*curl_args, runner=()):
     return {"ip": ip4, "country": None, "city": None, "org": None} if ip4 else None
 
 
-def vpn_probe(force=False):
-    """Look up where tunnel traffic exits. Fast while unconfirmed, then every 5 min."""
+def vpn_probe(force=False, count_fail=True):
+    """Look up where tunnel traffic exits. Fast while unconfirmed, then every 5 min.
+    count_fail=False: a failure doesn't count towards "server unreachable"
+    (quick retries right after the tunnel came up)."""
     cfg = vpn_cfg()
     p = PROVIDERS[cfg["provider"]]
     prev = read_json(EXIT_PROBE, {}) or {}
@@ -1090,10 +1271,15 @@ def vpn_probe(force=False):
         geo = geo_lookup(runner=("ip", "netns", "exec", EVPN_NS))
         if geo:
             geo["region"] = evpn_info()["region"]
+    elif cfg["provider"] == "warp":
+        if warp_info()["state"] != "Connected" or not sandbox_tunnel_present("warp"):
+            return prev
+        geo = geo_lookup(runner=("ip", "netns", "exec", "warp"))
     else:
         geo = geo_lookup("--socks5-hostname", SOCKS)
     res = {"at": int(time.time()), "provider": cfg["provider"], "invocation": invocation, "ok": bool(geo),
-           "fails": 0 if geo else (prev.get("fails", 0) + 1 if same else 1), **(geo or {})}
+           "fails": 0 if geo else ((prev.get("fails", 0) if same else 0) + (1 if count_fail else 0)),
+           **(geo or {})}
     if not geo and same and prev.get("ok"):
         # keep the last known exit for display, but mark it unconfirmed
         res.update({k: prev.get(k) for k in ("ip", "country", "city", "org")})
@@ -1134,6 +1320,7 @@ def vpn_status():
                  "credential_type": (cfg["geph"].get("credentials") or {}).get("type")},
         "outline": None,
         "expressvpn": {**cfg["expressvpn"], "installed": os.path.exists(EVPN_CTL)},
+        "warp": {**cfg["warp"], "installed": os.path.exists(WARP_CLI)},
         "service": sh("systemctl", "is-active", p["service"], check=False),
         "connection": "stopped", "detail": None, "exit": None, "protocol": None,
         "sessions": None, "load": None, "traffic": None, "account": None, "connected_since": None,
@@ -1203,6 +1390,27 @@ def vpn_status():
             waited = time.time() - started if started else 0
             st["detail"] = ("Still connecting. This network may be blocking Geph; it keeps trying other routes."
                             if waited > 90 else "Signing in and finding an exit server…")
+    elif provider == "warp":
+        info = warp_info()
+        state = info["state"]
+        st["warp"]["state"] = state
+        st["protocol"] = WARP_PROTOCOLS.get(cfg["warp"]["protocol"], cfg["warp"]["protocol"])
+        if state == "Connected" and sandbox_tunnel_present("warp"):
+            st["connection"] = "connected"
+            st["detail"] = "Connected."
+            if probe_fresh and probe.get("ok"):
+                st["exit"] = {k: probe.get(k) for k in ("country", "city", "ip", "org")}
+        elif state == "Connected":
+            st["connection"] = "connecting"
+            st["detail"] = "WARP's tunnel dropped; reconnecting (traffic is blocked meanwhile)…"
+        elif state == "Connecting":
+            st["connection"] = "connecting"
+            st["detail"] = f"Connecting to Cloudflare WARP ({st['protocol']})…"
+        elif not info["registered"]:
+            st["connection"] = "bad-credentials"
+            st["detail"] = "This Mariner isn't registered with WARP any more. Register again below."
+        else:
+            st["connection"], st["detail"] = "connecting", "Starting Cloudflare WARP…"
     elif provider == "expressvpn":
         info = evpn_info()
         state = info["state"]
@@ -1226,8 +1434,11 @@ def vpn_status():
             st["detail"] = "Connected."
             fresh = (probe.get("provider") == "expressvpn" and probe.get("ok")
                      and probe.get("region") in (None, region))  # not from before a location change
-            st["exit"] = {"region": region, **({k: probe.get(k) for k in ("country", "city", "ip", "org")}
-                                               if fresh else {})}
+            st["exit"] = {**({k: probe.get(k) for k in ("country", "city", "ip", "org")} if fresh else {})}
+            if region != "smart":
+                # ExpressVPN's own location name is authoritative. "Smart" isn't a
+                # place: then the measured exit (country flag, city) shows instead.
+                st["exit"]["region"] = region
         elif state in ("Connecting", "Reconnecting", "DisconnectingToReconnect", "Interrupted"):
             st["connection"] = "connecting"
             st["detail"] = ("Reconnecting to ExpressVPN…" if state != "Connecting"
@@ -1334,6 +1545,18 @@ def cmd_vpn_set(args):
                 evpn("set", "protocol", cfg["expressvpn"]["protocol"])
             if cfg["enabled"] and portal_state() != "portal":
                 evpn_connect(cfg, "settings changed")
+        elif cfg["provider"] == "warp":
+            if "warp_protocol" in d:
+                warp("tunnel", "protocol", "set", WARP_PROTOCOLS[cfg["warp"]["protocol"]])
+                if cfg["enabled"] and portal_state() != "portal":
+                    # Reconnect with the new protocol; reconcile (below) sees it settle.
+                    subprocess.run(["logger", "-t", "mariner-ctl",
+                                    f"WARP: switching to {WARP_PROTOCOLS[cfg['warp']['protocol']]}"], check=False)
+                    warp("disconnect", timeout=20)
+                    warp("connect", timeout=15)
+                    sh("systemd-run", "--quiet", "--collect", "-p", "StandardOutput=null", "--unit",
+                       unit_name("mariner-warp-settle"), "/usr/local/lib/mariner/bin/mariner-ctl", "evpn-settle",
+                       check=False)
         else:
             with reconcile_lock():
                 write_provider_conf(cfg)
@@ -1390,6 +1613,11 @@ def vpn_set_apply(d, outline=None):
             raise Fail("unknown ExpressVPN protocol")
         cfg["expressvpn"]["protocol"] = d["evpn_protocol"]
         restart = restart or cfg["provider"] == "expressvpn"
+    if "warp_protocol" in d:
+        if not isinstance(d["warp_protocol"], str) or d["warp_protocol"] not in WARP_PROTOCOLS:
+            raise Fail("unknown WARP protocol")
+        cfg["warp"]["protocol"] = d["warp_protocol"]
+        restart = restart or cfg["provider"] == "warp"
     if "outline_key" in d:
         if d["outline_key"] is None:
             cfg["outline"] = None
@@ -1416,6 +1644,18 @@ def cmd_vpn_enable(args):
         write_json(VPN_JSON, cfg)
     reconcile()
     return vpn_status()
+
+
+def cmd_vpn_settle(args):
+    """Right after the tunnel came up (mariner-tun-up): confirm it carries
+    traffic within seconds instead of at the next minute's check, so the
+    status turns "connected" as soon as it is, then reconcile once."""
+    for _ in range(20):
+        res = vpn_probe(force=True, count_fail=False)
+        if res.get("ok"):
+            break
+        time.sleep(3)
+    return reconcile()
 
 
 def cmd_vpn_probe(args):
@@ -1861,6 +2101,8 @@ def cmd_restart(args):
             raise Fail("the VPN is not running")
         if cfg["provider"] == "expressvpn":
             cmd = ["systemctl", "restart", "expressvpn-service.service", "mariner-evpn-dns.service"]
+        elif cfg["provider"] == "warp":
+            cmd = ["systemctl", "restart", "warp-svc.service", "mariner-warp-dns.service"]
         else:
             cmd = ["systemctl", "restart", PROVIDERS[cfg["provider"]]["service"], "mariner-tun.service",
                    "mariner-dns.service"]
@@ -1930,7 +2172,7 @@ COMMANDS = {
     "vpn-get": cmd_vpn_get, "vpn-set": cmd_vpn_set, "vpn-enable": cmd_vpn_enable,
     "vpn-exits": cmd_vpn_exits, "vpn-probe": cmd_vpn_probe, "portal-login-allow": cmd_portal_login_allow,
     "portal-revoke-sessions": cmd_portal_revoke_sessions,
-    "evpn-settle": cmd_evpn_settle,
+    "evpn-settle": cmd_evpn_settle, "warp-register": cmd_warp_register, "warp-unregister": cmd_warp_unregister, "vpn-settle": cmd_vpn_settle,
     "evpn-login": cmd_evpn_login, "evpn-logout": cmd_evpn_logout,
     "wifi-scan": cmd_wifi_scan, "wifi-saved": cmd_wifi_saved, "wifi-connect": cmd_wifi_connect,
     "wifi-forget": cmd_wifi_forget, "wifi-band": cmd_wifi_band, "wifi-lock": cmd_wifi_lock,

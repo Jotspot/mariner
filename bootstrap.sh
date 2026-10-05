@@ -28,6 +28,8 @@ GEPH_VERSION=0.4.2          # tested with Mariner
 OUTLINE=yes
 EXPRESSVPN_INSTALLER=""     # path or https:// URL of ExpressVPN's Linux .run installer
 ADD_EVPN=no                 # --add-expressvpn: only add ExpressVPN to an installed Mariner
+WARP=no                     # Cloudflare WARP (official app from Cloudflare's apt repo)
+ADD_WARP=no                 # --add-warp: only add WARP to an installed Mariner
 MINIMAL_FIRMWARE=yes
 DISABLE_CLOUD_INIT=yes
 UPGRADE=no
@@ -40,7 +42,7 @@ WIZARD=auto                 # auto | no
 # Which settings came from options (the wizard doesn't ask about those). The
 # SSID is passed on only when chosen, so re-runs keep a name set in the portal.
 SSID_SET=no PW_SET=no COUNTRY_SET=no HOSTNAME_SET=no GEPH_SET=no OUTLINE_SET=no
-EVPN_SET=no FW_SET=no UPGRADE_SET=no
+EVPN_SET=no FW_SET=no UPGRADE_SET=no WARP_SET=no
 
 usage() {
     cat <<'EOF'
@@ -76,6 +78,9 @@ VPN providers
                             README's ExpressVPN section for where to get it)
   --add-expressvpn F        Add ExpressVPN to an already installed Mariner (same F).
                             Runs only that step: nothing else is changed
+  --warp / --no-warp        Install Cloudflare WARP (the official app, from Cloudflare's
+                            package repository; ~1 GB with dependencies). Default: no
+  --add-warp                Add Cloudflare WARP to an already installed Mariner
 
 Install source
   --repo URL                Git repository (default: the official one)
@@ -231,6 +236,9 @@ while [ $# -gt 0 ]; do
         --no-outline) OUTLINE=no; OUTLINE_SET=yes ;;
         --expressvpn-installer) need_arg "$@"; EXPRESSVPN_INSTALLER=$2; EVPN_SET=yes; shift ;;
         --add-expressvpn) need_arg "$@"; EXPRESSVPN_INSTALLER=$2; EVPN_SET=yes; ADD_EVPN=yes; shift ;;
+        --warp) WARP=yes; WARP_SET=yes ;;
+        --no-warp) WARP=no; WARP_SET=yes ;;
+        --add-warp) WARP=yes; WARP_SET=yes; ADD_WARP=yes ;;
         --repo) need_arg "$@"; REPO=$2; shift ;;
         --branch) need_arg "$@"; BRANCH=$2; shift ;;
         -y|--yes) ASSUME_YES=yes ;;
@@ -257,7 +265,8 @@ valid_ssid "$HOTSPOT_SSID" || die "--ssid must be 1-32 bytes"
 valid_hostname "$HOSTNAME_NEW" || die "--hostname must be a valid lowercase hostname"
 [[ "$GEPH_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "--geph-version must look like 0.4.2"
 [ "$GEPH" != binary ] || [ -x "$GEPH_BINARY" ] || die "--geph-binary: $GEPH_BINARY is not an executable file"
-if [ "$ADD_EVPN" = yes ]; then WIZARD=no; fi
+if [ "$ADD_EVPN" = yes ] || [ "$ADD_WARP" = yes ]; then WIZARD=no; fi
+[ "$ADD_EVPN" = no ] || [ "$ADD_WARP" = no ] || die "--add-expressvpn and --add-warp: one at a time, please"
 if [ "$WIZARD" = auto ]; then
     if [ "$ASSUME_YES" = no ] && [ "$DRY_RUN" = no ] && [ "$TTY" = yes ]; then WIZARD=yes; else WIZARD=no; fi
 fi
@@ -314,6 +323,35 @@ evpn_check() {
         esac
     fi
     EXPRESSVPN_INSTALLER=$f
+}
+install_warp() {
+    # Mariner's drop-in confines warp-svc to its sandbox; it (and the sandbox
+    # unit) must be in place before the package's first start of the daemon.
+    run install -D -m 0644 "$DIR/systemd/warp-svc.service.d/mariner.conf" \
+        /etc/systemd/system/warp-svc.service.d/mariner.conf
+    run install -m 0644 "$DIR/systemd/mariner-warp-netns.service" /etc/systemd/system/
+    run install -m 0755 "$DIR/bin/mariner-sandbox-netns" /usr/local/lib/mariner/bin/
+    run systemctl daemon-reload
+    local codename
+    codename=$(. /etc/os-release && echo "${VERSION_CODENAME:-trixie}")
+    task "Adding Cloudflare's package repository" bash -o pipefail -c "
+        DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends gnupg ca-certificates curl &&
+        curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg |
+            gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg &&
+        echo 'deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $codename main' \
+            > /etc/apt/sources.list.d/cloudflare-client.list &&
+        apt-get update"
+    task "Installing Cloudflare WARP (official app, a few minutes)" env DEBIAN_FRONTEND=noninteractive \
+        apt-get install -y --no-install-recommends cloudflare-warp
+    run systemctl disable --quiet warp-svc.service
+    run systemctl stop warp-svc.service
+    # Finish the sandbox with Mariner's own installer (keeps the hotspot and
+    # the other VPNs as they are).
+    local outline=no hotspot=${PREV_HOTSPOT:-auto}
+    [ -x /usr/local/bin/sslocal ] && outline=yes
+    [ "$HOTSPOT" = auto ] || hotspot=$HOTSPOT
+    task "Sandboxing it" env -u MARINER_HOTSPOT_SSID -u MARINER_HOTSPOT_PASSWORD MARINER_HOTSPOT="$hotspot" \
+        MARINER_OUTLINE="$outline" GEPH_SRC=/nonexistent "$DIR/install.sh"
 }
 install_evpn() {
     # Mariner's drop-in confines the daemon to its sandbox; it must be in
@@ -391,6 +429,23 @@ command -v nmcli >/dev/null && systemctl is-active --quiet NetworkManager \
     || die "NetworkManager isn't running. Raspberry Pi OS Bookworm and later use it by default."
 done_line "NetworkManager is running"
 
+if [ "$ADD_WARP" = yes ]; then
+    # Only add WARP: no questions, Geph, hotspot or settings changes.
+    [ -d "$DIR/.git" ] && [ -x /usr/local/lib/mariner/bin/mariner-ctl ] \
+        || die "Mariner isn't installed here yet. Run the installer without --add-warp first."
+    [ -f "$DIR/systemd/warp-svc.service.d/mariner.conf" ] \
+        || die "This Mariner predates WARP support. Update it first: run the installer again without --add-warp."
+    done_line "Mariner is installed ($(git -C "$DIR" log -1 --format=%h 2>/dev/null || echo '?'))"
+    TOTAL=1
+    step "Cloudflare WARP"
+    if [ "$DRY_RUN" = yes ]; then
+        printf '\n  %sDry run: nothing was changed.%s\n\n' "$B" "$R"
+        exit 0
+    fi
+    install_warp
+    printf '\n  %s%sCloudflare WARP added.%s Open the control panel, VPN, choose WARP and register.\n\n' "$GREEN$B" "$TICK" "$R"
+    exit 0
+fi
 if [ "$ADD_EVPN" = yes ]; then
     # Only add ExpressVPN: no questions, packages, Geph, hotspot or settings changes.
     [ -d "$DIR/.git" ] && [ -x /usr/local/lib/mariner/bin/mariner-ctl ] \
@@ -469,6 +524,7 @@ if [ "$INSTALLED" = yes ]; then
         elif [ "$GEPH_HAVE" != "$GEPH_VERSION" ]; then GEPH=keep; fi   # e.g. --geph-binary
     fi
     if [ "$OUTLINE_SET" = no ] && [ ! -x /usr/local/bin/sslocal ]; then OUTLINE=no; fi
+    if [ "$WARP_SET" = no ] && [ -x /usr/bin/warp-cli ]; then WARP=yes; fi
 fi
 
 # --- questions ----------------------------------------------------------------------------
@@ -540,6 +596,10 @@ if [ "$WIZARD" = yes ]; then
         done
     fi
 
+    if [ "$WARP_SET" = no ] && [ ! -x /usr/bin/warp-cli ]; then
+        ask_yn WARP "Cloudflare WARP (official app)?" no "(free, no account; ~1 GB download)"
+    fi
+
     qhead "This Raspberry Pi"
     if [ "$HOSTNAME_SET" = no ]; then
         while :; do
@@ -592,6 +652,8 @@ if [ -x /opt/expressvpn/bin/expressvpnctl ]; then evpn_row="$(yesno yes) Express
 elif [ -n "$EXPRESSVPN_INSTALLER" ]; then evpn_row="$(yesno yes) ExpressVPN"
 else evpn_row="$(yesno no) ExpressVPN"; fi
 row "" "$evpn_row"
+if [ -x /usr/bin/warp-cli ]; then row "" "$(yesno yes) Cloudflare WARP (installed)"
+else row "" "$(yesno "$WARP") Cloudflare WARP"; fi
 row System "hostname $HOSTNAME_NEW$([ "$UPGRADE" = yes ] && echo ", full upgrade")$([ "$DISABLE_CLOUD_INIT" = yes ] && [ -d /etc/cloud ] && echo ", cloud-init off")"
 if [ "$WIZARD" = yes ]; then
     echo
@@ -600,7 +662,10 @@ if [ "$WIZARD" = yes ]; then
 fi
 
 TOTAL=5
-[ -z "$EXPRESSVPN_INSTALLER" ] || TOTAL=6
+[ -z "$EXPRESSVPN_INSTALLER" ] || TOTAL=$((TOTAL + 1))
+WARP_STEP=no
+[ "$WARP" = yes ] && [ ! -x /usr/bin/warp-cli ] && WARP_STEP=yes
+[ "$WARP_STEP" = no ] || TOTAL=$((TOTAL + 1))
 START=$SECONDS
 if [ "$DRY_RUN" = no ]; then
     install -d -m 0750 /etc/mariner
@@ -714,6 +779,12 @@ if [ -n "$EXPRESSVPN_INSTALLER" ]; then
     install_evpn
 fi
 
+# --- Cloudflare WARP (optional) ---------------------------------------------------------------
+if [ "$WARP_STEP" = yes ]; then
+    step "Cloudflare WARP"
+    install_warp
+fi
+
 # --- done ----------------------------------------------------------------------------------------
 if [ "$DRY_RUN" = yes ]; then
     printf '\n  %sDry run: nothing was changed.%s\n\n' "$B" "$R"
@@ -733,7 +804,7 @@ if [ "$HOTSPOT" = yes ]; then
 else
     row "Hotspot" "not set up (--no-hotspot or no suitable Wi-Fi radio)"
 fi
-vpns=$( { [ -x /usr/local/bin/geph5-client ] && printf 'Geph  '; [ -x /usr/local/bin/sslocal ] && printf 'Outline  '; [ -x /opt/expressvpn/bin/expressvpnctl ] && printf 'ExpressVPN'; } || true)
+vpns=$( { [ -x /usr/local/bin/geph5-client ] && printf 'Geph  '; [ -x /usr/local/bin/sslocal ] && printf 'Outline  '; [ -x /opt/expressvpn/bin/expressvpnctl ] && printf 'ExpressVPN  '; [ -x /usr/bin/warp-cli ] && printf 'WARP'; } || true)
 row "VPNs" "${vpns:-none}"
 row "Log" "$LOG"
 echo

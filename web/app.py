@@ -727,7 +727,7 @@ def vpn_provider(request: Request, provider: str = Form(...)):
     except CtlError as e:
         return back("/vpn", err=str(e))
     cache.poke(sync=["status"])
-    return back("/vpn", msg=f"Using {dict(geph='Geph', outline='Outline', expressvpn='ExpressVPN').get(provider, provider)}.")
+    return back("/vpn", msg=f"Using {dict(geph='Geph', outline='Outline', expressvpn='ExpressVPN', warp='Cloudflare WARP').get(provider, provider)}.")
 
 
 @app.post("/vpn/killswitch")
@@ -761,6 +761,42 @@ def geph_account(request: Request, kind: str = Form(...), secret: str = Form("")
         return back("/vpn", err=str(e))
     cache.poke(sync=["status"])
     return back("/vpn", msg="Geph account removed." if creds is None else "Geph account saved.")
+
+
+@app.post("/vpn/warp/register")
+def warp_register(request: Request):
+    try:
+        ctl("warp-register", timeout=150)
+    except CtlError as e:
+        return back("/vpn", err=str(e))
+    cache.poke(sync=["status"])
+    return back("/vpn", msg="Registered with Cloudflare WARP.")
+
+
+@app.post("/vpn/warp/unregister")
+def warp_unregister(request: Request):
+    try:
+        ctl("warp-unregister", timeout=120)
+    except CtlError as e:
+        return back("/vpn", err=str(e))
+    cache.poke(sync=["status"])
+    return back("/vpn", msg="WARP registration removed.")
+
+
+@app.post("/vpn/warp/settings")
+def warp_settings(request: Request, protocol: str = Form("masque")):
+    if protocol not in ("masque", "wireguard"):
+        return back("/vpn", err="Unknown protocol.")
+    label = "MASQUE" if protocol == "masque" else "WireGuard"
+
+    def expect(st):  # show the change right away; live refresh takes over
+        vpn = st.get("vpn") or {}
+        (vpn.get("warp") or {})["protocol"] = protocol
+        if vpn.get("enabled") and vpn.get("provider") == "warp":
+            vpn["connection"], vpn["detail"], vpn["protocol"] = "connecting", f"Reconnecting with {label}…", label
+    cache.patch("status", expect)
+    run_bg(request, "Couldn't change the WARP protocol", "vpn-set", data={"warp_protocol": protocol})
+    return back("/vpn", msg=f"Switching WARP to {label}…")
 
 
 @app.post("/vpn/expressvpn/login")

@@ -1,0 +1,9 @@
+[Unit]
+Description=Mariner: Cloudflare WARP sandbox network namespace (warp)
+After=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/lib/mariner/bin/mariner-sandbox-netns warp up
+ExecStop=/usr/local/lib/mariner/bin/mariner-sandbox-netns warp down

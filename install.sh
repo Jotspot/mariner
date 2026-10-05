@@ -212,6 +212,14 @@ systemctl daemon-reload
 if [ -f /etc/systemd/system/expressvpn-service.service ]; then
     systemctl disable expressvpn-service.service 2>/dev/null || true
 fi
+# Cloudflare WARP (optional, official app from Cloudflare's apt repo): the same
+# arrangement, in its own "warp" sandbox.
+install -d -m 0755 /etc/systemd/system/warp-svc.service.d
+install -m 0644 systemd/warp-svc.service.d/mariner.conf /etc/systemd/system/warp-svc.service.d/
+systemctl daemon-reload
+if systemctl list-unit-files warp-svc.service >/dev/null 2>&1; then
+    systemctl disable warp-svc.service 2>/dev/null || true
+fi
 systemctl enable mariner-reconcile.service mariner-firewall-early.service
 "$LIB/bin/mariner-ctl" reconcile >/dev/null
 

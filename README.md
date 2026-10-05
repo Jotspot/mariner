@@ -38,22 +38,23 @@ Mariner sits between those networks and your devices:
 
 ## Supported VPNs
 
-Mariner supports three VPN services, one at a time. You switch between them with a tap in the control panel.
+Mariner supports four VPN services, one at a time. You switch between them with a tap in the control panel.
 
-| | **Geph** | **Outline** | **ExpressVPN** |
-|---|---|---|---|
-| What it is | Censorship-circumvention VPN | Shadowsocks-based VPN; you run the server or get a key | Commercial VPN |
-| Strength | Built to beat national-scale censorship | Simple, fast, hard to fingerprint | Large server network, very easy |
-| Account | Free or Plus (account secret or username) | An access key (`ss://` or `ssconf://`) | Activation code from your subscription |
-| Installed by Mariner | ✅ compiled from source (optional, ~45 min) | ✅ prebuilt, checksum-verified | ⚠️ bring the official Linux installer (needs your account); Mariner sandboxes it |
-| Protocols | Geph's own (sosistab3) | Shadowsocks AEAD / 2022 | WireGuard (default), OpenVPN |
-| UDP (calls, games) | TCP-based | ✅ | ✅ |
-| Exit location | Automatic, country or city | Your server's | 216 locations, or "smart" |
+| | **Geph** | **Outline** | **ExpressVPN** | **Cloudflare WARP** |
+|---|---|---|---|---|
+| What it is | Censorship-circumvention VPN | Shadowsocks-based VPN; you run the server or get a key | Commercial VPN | Cloudflare's free encrypted tunnel |
+| Strength | Built to beat national-scale censorship | Simple, fast, hard to fingerprint | Large server network, very easy | Free, fast, nothing to sign up for |
+| Account | Free or Plus (account secret or username) | An access key (`ss://` or `ssconf://`) | Activation code from your subscription | None (free registration in the panel) |
+| Installed by Mariner | ✅ compiled from source (optional, ~45 min) | ✅ prebuilt, checksum-verified | ⚠️ bring the official Linux installer (needs your account); Mariner sandboxes it | ✅ official app from Cloudflare's repository (optional, ~1 GB); Mariner sandboxes it |
+| Protocols | Geph's own (sosistab3) | Shadowsocks AEAD / 2022 | WireGuard (default), OpenVPN | MASQUE (default), WireGuard |
+| UDP (calls, games) | TCP-based | ✅ | ✅ | ✅ |
+| Exit location | Automatic, country or city | Your server's | 216 locations, or "smart" | A nearby Cloudflare data centre |
 
 Notes:
 - Outline keys that use the `prefix=` disguise aren't supported yet.
 - ExpressVPN's own Lightway protocol works, but it runs at only about 1–2 Mbit/s on a Pi 4, so Mariner defaults to WireGuard.
-- Mariner isn't affiliated with Geph, Outline (Jigsaw/Google) or ExpressVPN.
+- WARP hides your traffic from the local network and gets around many blocks, but it isn't built for anonymity or for picking a country: you exit near where you are.
+- Mariner isn't affiliated with Geph, Outline (Jigsaw/Google), ExpressVPN or Cloudflare.
 
 ## Features
 
@@ -129,6 +130,7 @@ curl -fsSL https://raw.githubusercontent.com/Jotspot/mariner/main/bootstrap.sh |
 | `--no-outline` | Skip the Outline (Shadowsocks) client |
 | `--expressvpn-installer FILE` | Also install ExpressVPN from its official `.run` installer (path or `https://` link), sandboxed. See [ExpressVPN](#expressvpn) |
 | `--add-expressvpn FILE` | Add ExpressVPN to an already installed Mariner, changing nothing else |
+| `--warp` / `--add-warp` | Also install Cloudflare WARP (official app); or add it to an installed Mariner. See [Cloudflare WARP](#cloudflare-warp) |
 | `--no-hotspot` | Don't create the hotspot |
 | `--standard-firmware` | Keep the default Wi-Fi firmware (Mariner switches to the more stable "minimal" build) |
 | `--keep-cloud-init` | Don't disable cloud-init |
@@ -167,6 +169,27 @@ Good to know:
 - The app only ever runs inside the `evpn` sandbox, and only while ExpressVPN is the chosen VPN. Its own kill switch ("Network Lock") stays off; Mariner's kill switch covers the hotspot instead, and a guard inside the sandbox drops anything that doesn't leave through ExpressVPN's tunnel.
 - Mariner uses **WireGuard** by default. ExpressVPN's Lightway works too, but runs at only about 1–2 Mbit/s on a Pi 4.
 - The control panel can't install ExpressVPN, on purpose: a panel that could upload and run an installer as root would turn any panel compromise into full control of the Pi.
+
+## Cloudflare WARP
+
+Mariner runs **Cloudflare's official WARP app** (`cloudflare-warp` from Cloudflare's own package repository), sealed in its own network namespace exactly like ExpressVPN, so it can't touch the Pi's own routing, DNS or firewall.
+
+**Install it** during setup (answer yes to the WARP question, or pass `--warp`), or add it later to an installed Mariner. Nothing else changes:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Jotspot/mariner/main/bootstrap.sh | sudo bash -s -- --add-warp
+```
+
+The package pulls in about 1 GB of dependencies (including desktop libraries it never uses on a headless Pi).
+
+**Register.** In the control panel, open **VPN**, choose **WARP** and tap **Register**. That creates a free WARP registration for this Mariner (no account needed) and accepts Cloudflare's [WARP terms of service](https://www.cloudflare.com/application/terms/). Nothing contacts Cloudflare before you do this.
+
+**Protocol.** **MASQUE** (the default) travels as ordinary HTTPS (HTTP/3), so it gets through more networks. **WireGuard** is often a little faster but easier to spot and block. Switch any time in the panel; it reconnects in a few seconds.
+
+Good to know:
+- WARP has no locations: you come out at a nearby Cloudflare data centre, and the panel shows where (with its flag) once connected.
+- Mariner runs WARP in "tunnel only" mode: hotspot DNS goes through the tunnel via Mariner's own forwarder, never to the hotel's resolver.
+- With the kill switch on, a dropped WARP connection blocks hotspot traffic until it's back.
 
 ## How it works
 
@@ -315,7 +338,7 @@ The detector is tested offline against **108 simulated networks**: redirects, in
 | `bin/mariner-ctl` | The privileged control tool and VPN state machine |
 | `bin/mariner-check` | Captive-portal and connectivity detector |
 | `bin/mariner-dns` | Hotspot DNS proxy (DoH over SOCKS, or plain DNS in the ExpressVPN sandbox) |
-| `bin/mariner-evpn-netns` | ExpressVPN sandbox and its leak guard |
+| `bin/mariner-sandbox-netns` | Network-namespace sandboxes for ExpressVPN and WARP, and their leak guards |
 | `web/` | Control panel (FastAPI, Jinja, hand-written Material 3 CSS) |
 | `systemd/`, `nm/` | Units, timers, NetworkManager and udev configuration |
 | `tests/` | Leak-test client, fake captive portal, Outline self-test, 108-scenario portal simulator |

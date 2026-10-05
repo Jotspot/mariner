@@ -1,0 +1,18 @@
+[Unit]
+Description=Mariner: hotspot DNS through Cloudflare WARP (inside the warp sandbox)
+PartOf=mariner-vpn-warp.target
+Requires=mariner-warp-netns.service
+After=mariner-warp-netns.service warp-svc.service
+
+[Service]
+# Same user as ExpressVPN's forwarder: the only one the sandbox guard lets
+# send through the tunnel, so DNS can't leak if WARP disconnects.
+User=mariner-dns
+NetworkNamespacePath=/run/netns/warp
+Environment=MARINER_DNS_ADDR=10.200.0.6 MARINER_DNS_UPSTREAM=resolv MARINER_DNS_RESOLV=/etc/netns/warp/resolv.conf
+ExecStart=/usr/bin/python3 /usr/local/lib/mariner/bin/mariner-dns
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes

@@ -8,4 +8,7 @@ ip route replace default dev vpn0 metric 10 table 100
 # Apply Mariner's routing and firewall for the new tunnel right away (with the
 # kill switch off nothing else would route hotspot traffic into it until the
 # next check). In the background: tun2socks waits for this script.
-setsid /usr/local/lib/mariner/bin/mariner-ctl reconcile --no-units --wait >/dev/null 2>&1 &
+# Then confirm the VPN carries traffic (a few seconds, not the next minute's
+# check), so the status shows "connected" as soon as it is.
+setsid sh -c '/usr/local/lib/mariner/bin/mariner-ctl reconcile --no-units --wait
+              /usr/local/lib/mariner/bin/mariner-ctl vpn-settle' >/dev/null 2>&1 &
