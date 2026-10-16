@@ -45,6 +45,16 @@ QUERY_DEADLINE = 9.0    # whole query, including waiting for a free connection
 TCP_IDLE = 20.0         # close idle client TCP connections
 SOCKS_DOWN_HOLD = 2.0   # after "connection refused", answer REFUSED without retrying for this long
 CACHE_MAX = 5000
+# Over a slow tunnel (Geph through a bridge: ~250 ms round trips) a fresh DoH
+# connection costs ~1 s (SOCKS + TCP + TLS). So: reuse the most recently used
+# connection (LIFO), keep a couple warm while DNS is in use, and answer from
+# a just-expired cache entry while refreshing it in the background.
+IDLE_MAX = 45.0          # a connection idle this long is assumed dropped: reconnect instead of trying it
+KEEPALIVE_EVERY = 15.0   # warm-keeping interval ...
+KEEPALIVE_SLOTS = 2      # ... for this many connections ...
+KEEPALIVE_WHILE = 600.0  # ... while DNS was used in the last 10 minutes
+STALE_MAX = 6 * 3600     # serve an expired answer (TTL 30 s) up to this long while refreshing it
+STALE_TTL = 30
 # "doh": DNS-over-HTTPS through the SOCKS port (Geph, Outline).
 # "resolv": plain DNS to the nameservers in MARINER_DNS_RESOLV (ExpressVPN).
 UPSTREAM = os.environ.get("MARINER_DNS_UPSTREAM", "doh")
@@ -163,6 +173,18 @@ def min_ttl(msg):
     return max(5, min(min(ttls) if ttls else 60, 3600))
 
 
+def set_ttls(msg, ttl):
+    """The same message with every TTL (OPT excluded) set to ttl."""
+    b = bytearray(msg)
+    try:
+        for o, t in walk_records(msg):
+            if t != 41:
+                struct.pack_into(">I", b, o + 4, ttl)
+    except (IndexError, struct.error, ValueError):
+        return msg
+    return bytes(b)
+
+
 def age_ttls(msg, elapsed):
     """The same message with every TTL (OPT excluded) reduced by elapsed seconds."""
     b = bytearray(msg)
@@ -221,6 +243,7 @@ class DohConn:
     def __init__(self, upstream):
         self.ip, self.host, self.path = upstream
         self.reader = self.writer = None
+        self.last_used = 0.0
 
     async def connect(self):
         try:
@@ -248,8 +271,11 @@ class DohConn:
         self.reader, self.writer = r, w
 
     async def query(self, msg):
+        if self.writer is not None and time.monotonic() - self.last_used > IDLE_MAX:
+            self.close()  # likely dropped by the server or the tunnel: don't pay for finding out
         if self.writer is None:
             await self.connect()
+        self.last_used = time.monotonic()
         req = (f"POST {self.path} HTTP/1.1\r\nHost: {self.host}\r\n"
                "Content-Type: application/dns-message\r\nAccept: application/dns-message\r\n"
                f"Content-Length: {len(msg)}\r\n\r\n").encode() + msg
@@ -325,22 +351,29 @@ def plain_query(body):
 
 class Resolver:
     def __init__(self):
-        self.pool = asyncio.Queue()
+        # LIFO: the most recently used (still open) connection is handed out first.
+        self.pool = asyncio.LifoQueue()
         for _ in range(POOL_SIZE):
             self.pool.put_nowait([DohConn(UPSTREAMS[0])])
         self.cache = {}
         self.socks_down_until = 0.0
+        self.last_query = 0.0
+        self.refreshing = set()
 
     def cache_get(self, key):
+        """(answer, stale) or (None, False). A stale answer (expired less than
+        STALE_MAX ago) carries TTL STALE_TTL; the caller refreshes it."""
         hit = self.cache.get(key)
         if not hit:
-            return None
+            return None, False
         expires, stored, ans = hit
         now = time.monotonic()
-        if expires <= now:
+        if expires > now:
+            return age_ttls(ans, int(now - stored)), False
+        if now - expires > STALE_MAX:
             del self.cache[key]
-            return None
-        return age_ttls(ans, int(now - stored))
+            return None, False
+        return set_ttls(ans, STALE_TTL), True
 
     def cache_put(self, key, ans):
         if rcode(ans) not in (0, 3):  # NOERROR / NXDOMAIN only
@@ -358,9 +391,24 @@ class Resolver:
         if q["name"] in LOCAL_NAMES:
             return local_answer(query, q)
         key = (q["name"], q["qtype"], q["qclass"], bool(q["edns"] and q["edns"][1]))
-        cached = self.cache_get(key)
+        self.last_query = time.monotonic()
+        cached, stale = self.cache_get(key)
         if cached:
+            if stale and key not in self.refreshing:
+                self.refreshing.add(key)
+                asyncio.ensure_future(self.refresh(key, query, q))
             return for_client(query, q, cached)
+        return await self.lookup(key, query, q)
+
+    async def refresh(self, key, query, q):
+        try:
+            await self.lookup(key, query, q)
+        except Exception:
+            pass
+        finally:
+            self.refreshing.discard(key)
+
+    async def lookup(self, key, query, q):
         if UPSTREAM == "resolv":
             ans = await asyncio.to_thread(plain_query, query[2:])
         else:
@@ -374,6 +422,39 @@ class Resolver:
             return error_reply(query, q, RCODE_SERVFAIL)
         self.cache_put(key, ans)
         return for_client(query, q, ans)
+
+    async def keepalive(self):
+        """Keep the most recently used connections open while DNS is in use,
+        so a lookup costs one round trip through the tunnel, not a new TLS
+        connection."""
+        probe = struct.pack(">HHHHHH", 0, 0x0100, 1, 0, 0, 0) + b"\x00" + struct.pack(">HH", 2, 1)  # ". NS"
+        while True:
+            await asyncio.sleep(KEEPALIVE_EVERY)
+            now = time.monotonic()
+            if UPSTREAM != "doh" or now - self.last_query > KEEPALIVE_WHILE or self.socks_down_until > now:
+                continue
+            taken = []
+            try:
+                for _ in range(KEEPALIVE_SLOTS):
+                    try:
+                        taken.append(self.pool.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+                for slot in taken:
+                    conn = slot[0]
+                    if conn.writer is None or now - conn.last_used < KEEPALIVE_EVERY:
+                        continue
+                    try:
+                        await asyncio.wait_for(conn.query(probe), ATTEMPT_TIMEOUT)
+                    except (OSError, asyncio.TimeoutError, asyncio.IncompleteReadError, ValueError, IndexError):
+                        conn.close()
+            except asyncio.CancelledError:
+                for slot in taken:
+                    slot[0].close()
+                raise
+            finally:
+                for slot in reversed(taken):  # keep their order on the LIFO stack
+                    self.pool.put_nowait(slot)
 
     async def doh(self, query, q):
         if self.socks_down_until > time.monotonic():
@@ -467,6 +548,7 @@ async def main():
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     resolver = Resolver()
     loop = asyncio.get_running_loop()
+    asyncio.ensure_future(resolver.keepalive())
     await loop.create_datagram_endpoint(lambda: UdpServer(resolver), sock=bound_socket(socket.SOCK_DGRAM))
     server = await asyncio.start_server(lambda r, w: tcp_client(r, w, resolver), sock=bound_socket(socket.SOCK_STREAM))
     names = ", ".join(sorted(LOCAL_NAMES))
