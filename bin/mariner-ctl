@@ -927,6 +927,11 @@ def nft_ruleset(block, dns_tunnel, provider="geph", sandbox_dns=False, allow_ips
     hs = ", ".join(f'"{i}"' for i in hotspot_ifs())
     allow = ", ".join(allow_ips)
     forward = ""
+    if provider == "geph":
+        # Geph's exits refuse QUIC (HTTP/3 over UDP 443), but silently: browsers
+        # wait seconds before falling back to TCP. Refuse it here at once instead.
+        forward += (f'        iifname {{ {hs} }} oifname "{TUN_IF}" udp dport 443 '
+                    'counter reject comment "geph: no QUIC, use TCP now"\n')
     if block:
         if allow:
             forward += f'        ip saddr {{ {allow} }} counter accept comment "login window"\n'
