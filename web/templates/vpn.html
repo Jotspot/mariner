@@ -44,7 +44,7 @@
     {% elif h %}
       {% set t = h[0] %}
       <p class="headline">{{ t.down_mbps }} <span class="body-m muted">Mbit/s down</span></p>
-      <p class="body-m">{{ t.up_mbps }} Mbit/s up · {{ t.ping_ms }} ms · via {{ t.via }}{% if t.exit_city or t.exit_country %}, {{ t.exit_city or (t.exit_country|country) }}{% endif %} · {{ t.at|since }} ago</p>
+      <p class="body-m">{{ t.up_mbps }} Mbit/s up · {{ t.ping_ms }} ms · via {{ t.via }}{% if t.exit_city or t.exit_country %}, {{ t.exit_city or (t.exit_country|country) }}{% endif %} · {% set ago = t.at|since %}{{ ago if ago == "just now" else ago ~ " ago" }}</p>
     {% else %}
       <p class="body-m">Measures speed and latency through the VPN that's on now (or the plain network with it off), from Mariner itself. Uses up to about 60 MB. Results are kept for an hour.</p>
     {% endif %}
