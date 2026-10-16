@@ -86,6 +86,17 @@
     <div class="card-actions"><button class="btn filled" type="submit" data-busy="Saving…">Save</button></div>
   </form>
 
+  <section class="card" data-live="vpn-geph-ipv6">
+    <form method="post" action="/vpn/geph/ipv6" class="switch-row">
+      {{ csrf_field(csrf) }}<input type="hidden" name="ipv6" value="{{ '0' if v.geph.ipv6 else '1' }}">
+      <div class="grow">
+        <p class="title-m">Allow IPv6 bridges</p>
+        <p class="body-m">Off: Geph uses IPv4 bridges only, which were far faster in testing. Turn on if Geph can't connect on a network where IPv4 bridges are blocked.</p>
+      </div>
+      <button class="switch {{ 'on' if v.geph.ipv6 }}" type="submit" role="switch" aria-checked="{{ 'true' if v.geph.ipv6 else 'false' }}" aria-label="Allow IPv6 bridges"></button>
+    </form>
+  </section>
+
   <h2 class="title-m section-title">Geph account</h2>
   <section class="card">
     {% if v.configured.geph %}

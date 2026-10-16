@@ -14,6 +14,10 @@ Environment=RUST_LOG=info NO_COLOR=1
 ExecStart=/usr/local/bin/geph5-client --config ${CREDENTIALS_DIRECTORY}/geph.yaml
 Restart=always
 RestartSec=15
+# IPv4 only. Geph prefers IPv6 bridges when the Pi has IPv6, and those routes
+# measured ~1 Mbit/s against ~80 Mbit/s over IPv4 bridges on the same network.
+# (The hotspot is IPv4-only anyway; Geph's own IPv6 is refused, nothing else.)
+IPAddressDeny=::/0
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

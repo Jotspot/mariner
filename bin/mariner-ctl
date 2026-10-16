@@ -76,7 +76,7 @@ PROVIDERS = {
     "warp": {"name": "Cloudflare WARP", "service": "warp-svc.service", "target": "mariner-vpn-warp.target"},
 }
 VPN_DEFAULTS = {"enabled": False, "provider": "geph", "killswitch": True,
-                "geph": {"exit": "auto", "credentials": None}, "outline": None,
+                "geph": {"exit": "auto", "credentials": None, "ipv6": False}, "outline": None,
                 "expressvpn": {"signed_in": False, "region": "smart", "protocol": "wireguard"},
                 "warp": {"registered": False, "protocol": "masque"}}
 
@@ -352,6 +352,31 @@ def write_geph_yaml(cfg):
         "spoof_dns: false\n"
         "passthrough_china: false\n"
         + exit_yaml + BROKER_YAML + cred_yaml))
+    geph_ipv6_dropin(bool(g.get("ipv6")))
+
+
+GEPH_V6_DROPIN = "/run/systemd/system/geph5.service.d/50-mariner-ipv6.conf"
+
+
+def geph_ipv6_dropin(allow):
+    """geph5.service blocks IPv6 (IPAddressDeny=::/0): over IPv6 bridges Geph
+    measured ~1 Mbit/s against ~80 over IPv4. "Allow IPv6 bridges" lifts that
+    with a runtime drop-in (for networks, e.g. in China, where IPv6 bridges get
+    through and IPv4 ones don't). Applied on the next (re)start of geph5."""
+    want = "[Service]\nIPAddressDeny=\n" if allow else None
+    try:
+        have = open(GEPH_V6_DROPIN).read()
+    except OSError:
+        have = None
+    if have == want:
+        return
+    if want:
+        os.makedirs(os.path.dirname(GEPH_V6_DROPIN), exist_ok=True)
+        with open(GEPH_V6_DROPIN, "w") as f:
+            f.write(want)
+    else:
+        os.remove(GEPH_V6_DROPIN)
+    sh("systemctl", "daemon-reload", check=False)
 
 
 def control_rpc(method, *params, timeout=10):
@@ -1316,7 +1341,7 @@ def vpn_status():
         "provider": provider, "provider_name": p["name"],
         "configured": {name: configured(cfg, name) for name in PROVIDERS},
         "has_credentials": configured(cfg, provider),
-        "geph": {"exit": cfg["geph"]["exit"],
+        "geph": {"exit": cfg["geph"]["exit"], "ipv6": bool(cfg["geph"].get("ipv6")),
                  "credential_type": (cfg["geph"].get("credentials") or {}).get("type")},
         "outline": None,
         "expressvpn": {**cfg["expressvpn"], "installed": os.path.exists(EVPN_CTL)},
@@ -1578,6 +1603,11 @@ def vpn_set_apply(d, outline=None):
         if not isinstance(d["killswitch"], bool):
             raise Fail("invalid kill switch value")
         cfg["killswitch"] = d["killswitch"]
+    if "geph_ipv6" in d:
+        if not isinstance(d["geph_ipv6"], bool):
+            raise Fail("invalid IPv6 setting")
+        cfg["geph"]["ipv6"] = d["geph_ipv6"]
+        restart = restart or cfg["provider"] == "geph"
     if "exit" in d:
         ex = text(d["exit"], "exit", 64)
         # Country code, optionally /city: city names can be non-ASCII ("São Paulo").

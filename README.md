@@ -51,6 +51,7 @@ Mariner supports four VPN services, one at a time. You switch between them with 
 | Exit location | Automatic, country or city | Your server's | 216 locations, or "smart" | A nearby Cloudflare data centre |
 
 Notes:
+- Geph uses IPv4 bridges only by default: on a network with IPv6, its IPv6 bridges measured around 1 Mbit/s against 70-90 Mbit/s over IPv4. If Geph can't connect somewhere IPv4 bridges are blocked, turn on **Allow IPv6 bridges** on the VPN page.
 - Outline keys that use the `prefix=` disguise aren't supported yet.
 - ExpressVPN's own Lightway protocol works, but it runs at only about 1–2 Mbit/s on a Pi 4, so Mariner defaults to WireGuard.
 - WARP hides your traffic from the local network and gets around many blocks, but it isn't built for anonymity or for picking a country: you exit near where you are.

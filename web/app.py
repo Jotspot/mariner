@@ -746,6 +746,14 @@ def geph_exit(request: Request, exit: str = Form("auto")):
     return back("/vpn", msg="Exit location saved. Reconnecting…")
 
 
+@app.post("/vpn/geph/ipv6")
+def geph_ipv6(request: Request, ipv6: str = Form("0")):
+    on = ipv6 == "1"
+    cache.patch("status", lambda st: ((st.get("vpn") or {}).get("geph") or {}).update(ipv6=on))
+    run_bg(request, "Couldn't change the IPv6 setting", "vpn-set", data={"geph_ipv6": on})
+    return back("/vpn", msg=("IPv6 bridges allowed." if on else "IPv4 bridges only.") + " Reconnecting…")
+
+
 @app.post("/vpn/geph/account")
 def geph_account(request: Request, kind: str = Form(...), secret: str = Form(""),
                  username: str = Form(""), password: str = Form("")):
