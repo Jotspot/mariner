@@ -746,6 +746,13 @@ def geph_exit(request: Request, exit: str = Form("auto")):
     return back("/vpn", msg="Exit location saved. Reconnecting…")
 
 
+@app.post("/vpn/speedtest")
+def vpn_speedtest(request: Request):
+    cache.patch("status", lambda st: (st.get("vpn") or {}).setdefault("speedtest", {}).update(running=True))
+    run_bg(request, "Speed test failed", "vpn-speedtest", timeout=90)
+    return back("/vpn", msg="Testing speed… (about 25 seconds)")
+
+
 @app.post("/vpn/geph/ipv6")
 def geph_ipv6(request: Request, ipv6: str = Form("0")):
     on = ipv6 == "1"

@@ -36,6 +36,28 @@
     </dl>
   </section>
 
+  <h2 class="title-m section-title">Speed test</h2>
+  <section class="card" data-live="vpn-speedtest">
+    {% set sp = v.speedtest or {} %}{% set h = sp.history or [] %}
+    {% if sp.running %}
+      <p class="body-m pending-line">Testing through {{ v.provider_name if v.mode == "on" else "the plain network" }}… (about 25 seconds)</p>
+    {% elif h %}
+      {% set t = h[0] %}
+      <p class="headline">{{ t.down_mbps }} <span class="body-m muted">Mbit/s down</span></p>
+      <p class="body-m">{{ t.up_mbps }} Mbit/s up · {{ t.ping_ms }} ms · via {{ t.via }}{% if t.exit_city or t.exit_country %}, {{ t.exit_city or (t.exit_country|country) }}{% endif %} · {{ t.at|since }} ago</p>
+    {% else %}
+      <p class="body-m">Measures speed and latency through the VPN that's on now (or the plain network with it off), from Mariner itself. Uses up to about 60 MB. Results are kept for an hour.</p>
+    {% endif %}
+    {% if h|length > 1 %}
+      <dl class="kv mt">
+        {% for t in h[1:5] %}<dt>{{ t.via }}{% if t.exit_city or t.exit_country %} · {{ t.exit_city or (t.exit_country|country) }}{% endif %}</dt><dd>{{ t.down_mbps }} ↓ · {{ t.up_mbps }} ↑ · {{ t.ping_ms }} ms</dd>{% endfor %}
+      </dl>
+    {% endif %}
+    <form method="post" action="/vpn/speedtest" class="card-actions">
+      {{ csrf_field(csrf) }}<button class="btn tonal" type="submit" {{ "disabled" if sp.running }} data-busy="Testing…">{{ icon("refresh") }}Run speed test</button>
+    </form>
+  </section>
+
   <h2 class="title-m section-title">Service</h2>
   <section class="card" data-live="vpn-service">
     <form method="post" action="/vpn/provider">

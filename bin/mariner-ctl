@@ -1248,6 +1248,78 @@ def reconcile_state(cfg, provider, portal, has_creds, block, route_tunnel, dns_t
 
 # --- where traffic comes out ---------------------------------------------------------
 
+SPEEDTEST = "/var/lib/mariner/speedtest.json"     # {"history": [...]} newest first
+SPEEDTEST_RUNNING = f"{RUN}/speedtest-running"
+SPEED_DOWN = "https://speed.cloudflare.com/__down?bytes=50000000"   # capped: hotel data allowances
+SPEED_UP = "https://speed.cloudflare.com/__up"
+SPEED_PING = "https://speed.cloudflare.com/__down?bytes=0"
+SPEEDTEST_KEEP = 3600   # results older than an hour are dropped (networks and exits change)
+
+
+def speed_path(cfg, st):
+    """How hotspot traffic leaves right now, as (label, curl runner, curl args)."""
+    provider = cfg["provider"]
+    if st.get("mode") != "on" or st.get("connection") != "connected":
+        if st.get("mode") == "off":
+            return "No VPN", (), []
+        raise Fail("The VPN isn't connected yet. Try again once it is (or turn it off to test the plain network).")
+    if provider in SANDBOX:
+        return PROVIDERS[provider]["name"], ("ip", "netns", "exec", SANDBOX[provider]["ns"]), []
+    return PROVIDERS[provider]["name"], (), ["--socks5-hostname", SOCKS]
+
+
+def cmd_vpn_speedtest(args):
+    """Latency, download and upload through the path hotspot traffic takes now
+    (the active VPN, or the plain network with the VPN off). About 25 s."""
+    cfg = vpn_cfg()
+    st = vpn_status()
+    label, runner, extra = speed_path(cfg, st)
+    lock = open(f"{RUN}/speedtest.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise Fail("A speed test is already running.")
+    open(SPEEDTEST_RUNNING, "w").close()
+    try:
+        def curl(*a, timeout):
+            p = subprocess.run([*runner, "curl", "-s", "-o", "/dev/null", *extra, *a], capture_output=True,
+                               text=True, timeout=timeout)
+            return p.stdout.strip().split()
+        # Latency: one request/response on an already open connection (curl
+        # reuses it across the URLs), so the TCP/TLS set-up through the tunnel
+        # doesn't count; the first, cold request is skipped.
+        out = curl("-m", "15", "-w", "%{time_starttransfer} %{time_pretransfer} %{http_code}\n",
+                   SPEED_PING, SPEED_PING, SPEED_PING, SPEED_PING, timeout=25)
+        pings = []
+        for i in range(1, len(out) // 3):
+            ttfb, pre, code = out[3 * i:3 * i + 3]
+            if code == "200":
+                pings.append((float(ttfb) - float(pre)) * 1000)
+        if not pings:
+            raise Fail("The speed test server couldn't be reached through " + label + ".")
+        out = curl("-m", "10", "-w", "%{size_download} %{time_total}", SPEED_DOWN, timeout=20)
+        down = float(out[0]) * 8 / float(out[1]) / 1e6 if len(out) == 2 and float(out[1]) > 0 else 0.0
+        # Streamed (never read into memory); the 8 s limit ends it.
+        out = curl("-m", "8", "-w", "%{size_upload} %{time_total}", "-X", "POST", "-H",
+                   "Content-Type: application/octet-stream", "--upload-file", "/dev/zero", SPEED_UP, timeout=15)
+        up = float(out[0]) * 8 / float(out[1]) / 1e6 if len(out) == 2 and float(out[1]) > 0 else 0.0
+        ex = st.get("exit") or {}
+        res = {"at": int(time.time()), "via": label, "provider": cfg["provider"] if st.get("mode") == "on" else None,
+               "exit_country": ex.get("country"), "exit_city": ex.get("city"),
+               "exit_region": ex.get("region"), "ping_ms": round(sorted(pings)[len(pings) // 2]),
+               "down_mbps": round(down, 1), "up_mbps": round(up, 1)}
+        hist = [h for h in (read_json(SPEEDTEST, {}) or {}).get("history", [])
+                if h.get("at", 0) > time.time() - SPEEDTEST_KEEP]
+        write_json(SPEEDTEST, {"history": ([res] + hist)[:8]}, 0o644)
+        subprocess.run(["logger", "-t", "mariner-ctl", f"speed test via {label}: {res['down_mbps']} down, "
+                        f"{res['up_mbps']} up, {res['ping_ms']} ms"], check=False)
+        return res
+    finally:
+        if os.path.exists(SPEEDTEST_RUNNING):
+            os.remove(SPEEDTEST_RUNNING)
+        lock.close()
+
+
 def geo_lookup(*curl_args, runner=()):
     """Public IPv4 + location as seen from the internet, via the given curl path.
 
@@ -1487,6 +1559,9 @@ def vpn_status():
         else:
             st["connection"], st["detail"] = "connecting", "Connecting to the Outline server…"
     st["connected_since"] = connected_since(st["connection"] == "connected")
+    st["speedtest"] = {"history": [h for h in (read_json(SPEEDTEST, {}) or {}).get("history", [])
+                                    if h.get("at", 0) > time.time() - SPEEDTEST_KEEP],
+                       "running": os.path.exists(SPEEDTEST_RUNNING)}
     # The login window as it is now (the saved state can lag behind a close).
     win = login_window()
     st["login_window_until"] = win["until"] if win else 0
@@ -2207,7 +2282,7 @@ COMMANDS = {
     "vpn-get": cmd_vpn_get, "vpn-set": cmd_vpn_set, "vpn-enable": cmd_vpn_enable,
     "vpn-exits": cmd_vpn_exits, "vpn-probe": cmd_vpn_probe, "portal-login-allow": cmd_portal_login_allow,
     "portal-revoke-sessions": cmd_portal_revoke_sessions,
-    "evpn-settle": cmd_evpn_settle, "warp-register": cmd_warp_register, "warp-unregister": cmd_warp_unregister, "vpn-settle": cmd_vpn_settle,
+    "vpn-speedtest": cmd_vpn_speedtest, "evpn-settle": cmd_evpn_settle, "warp-register": cmd_warp_register, "warp-unregister": cmd_warp_unregister, "vpn-settle": cmd_vpn_settle,
     "evpn-login": cmd_evpn_login, "evpn-logout": cmd_evpn_logout,
     "wifi-scan": cmd_wifi_scan, "wifi-saved": cmd_wifi_saved, "wifi-connect": cmd_wifi_connect,
     "wifi-forget": cmd_wifi_forget, "wifi-band": cmd_wifi_band, "wifi-lock": cmd_wifi_lock,

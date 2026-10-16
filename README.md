@@ -307,6 +307,7 @@ The detector is tested offline against **108 simulated networks**: redirects, in
 
 ## Using it on the road
 
+- **Which exit is fastest here?** The VPN page has a **speed test** (latency, download, upload) run by Mariner itself through whichever VPN is on, so the result is the tunnel's speed, not your phone's Wi-Fi. Recent results (kept an hour) show which exit or VPN did best. It uses up to about 60 MB.
 - **Captive portal:** the home screen shows *This network needs you to log in*. Tap **Open login page** (or **Allow this device 10 min** first if the kill switch is on: only that device gets direct access), log in, and Mariner resumes the VPN within a minute. If the captured login link has expired, **Open a plain-HTTP page** makes the network show its login page again.
 - **Hotspot won't start on a hotel network:** the network is probably on a 5 GHz radar (DFS) channel, where the Pi may not run a hotspot. In **Wi-Fi**, open the network and choose **2.4 GHz**.
 - **Devices keep dropping on a mesh or hotel network:** the uplink is roaming between access points and dragging the hotspot's channel with it. Turn on **Stay on this access point**.
