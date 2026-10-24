@@ -34,7 +34,7 @@ nft flush ruleset
 nft -f "$SNAP/nft.rules"
 # Only Mariner's own policy rules: flushing and restoring everything would
 # duplicate the kernel's built-in rules.
-for prio in $(seq 900 909) $(seq 1000 1009); do
+for prio in $(seq 900 909) 950 $(seq 1000 1009); do
     while ip rule del priority "$prio" 2>/dev/null; do :; done
 done
 

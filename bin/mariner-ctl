@@ -62,6 +62,7 @@ CONTROL = ("127.0.0.1", 12222)
 SOCKS = "127.0.0.1:9909"
 LOGIN_WINDOW_SECS = 600
 ALLOW_PRIO = 900                 # ip rules for login-window devices (900-909), ahead of the VPN rules (1000+)
+BYPASS_PRIO = 950                # ip rule: hotspot traffic to the Outline server itself goes direct
 SUSPECT_PORTAL_SECS = 180        # VPN on, network "fine", tunnel still down this long: maybe an undetected portal
 # Tests only: extra interfaces treated exactly like the hotspot (e.g. a veth
 # to a network namespace that plays a phone). Lives in /run, so a reboot
@@ -441,12 +442,25 @@ def split_host_port(hp):
 
 
 def check_ss_params(query):
+    """The key's raw prefix= text, or None."""
     q = parse_qs(query)
-    if "prefix" in q:
-        raise Fail("This access key uses Outline's \"prefix\" disguise, which Mariner's Outline client "
-                   "(shadowsocks-rust) doesn't support yet. Ask for a key without a prefix.")
     if "plugin" in q:
         raise Fail("Shadowsocks plugins aren't supported.")
+    return q["prefix"][0] if "prefix" in q else None
+
+
+def ss_prefix(text, method):
+    """Outline's prefix disguise -> base64 bytes for mariner-ss. Outline treats each
+    character as one byte, so %C2%A8 (U+00A8) is the single byte 0xA8."""
+    if method.startswith("2022-"):
+        raise Fail("A prefix only works with classic Shadowsocks keys, not 2022-blake3 ones.")
+    try:
+        raw = text.encode("latin-1")
+    except UnicodeEncodeError:
+        raise Fail("the access key's prefix isn't valid")
+    if not 0 < len(raw) <= (16 if method == "aes-128-gcm" else 32):
+        raise Fail("the access key's prefix is too long")
+    return base64.b64encode(raw).decode()
 
 
 def parse_ss_url(url):
@@ -454,7 +468,7 @@ def parse_ss_url(url):
     rest = url[len("ss://"):]
     rest, _, frag = rest.partition("#")
     rest, _, query = rest.partition("?")
-    check_ss_params(query)
+    prefix = check_ss_params(query)
     rest = rest.rstrip("/")
     try:
         if "@" in rest:
@@ -474,8 +488,11 @@ def parse_ss_url(url):
     method = method.lower()
     if method not in SS_METHODS:
         raise Fail(f"unsupported encryption method {clean(method, 40)!r}")
-    return {"server": host, "server_port": port, "method": method, "password": password,
-            "name": clean(unquote(frag), 60)}
+    srv = {"server": host, "server_port": port, "method": method, "password": password,
+           "name": clean(unquote(frag), 60)}
+    if prefix is not None:
+        srv["prefix"] = ss_prefix(prefix, method)
+    return srv
 
 
 def fetch_ssconf(url):
@@ -494,8 +511,6 @@ def fetch_ssconf(url):
         d = None
     if not isinstance(d, dict):
         raise Fail("the dynamic access key returned something unexpected")
-    if d.get("prefix"):
-        check_ss_params("prefix=1")
     try:
         host, port = split_host_port(f"{d['server']}:{int(d['server_port'])}"
                                      if ":" not in str(d["server"]) else f"[{d['server']}]:{int(d['server_port'])}")
@@ -505,7 +520,10 @@ def fetch_ssconf(url):
         raise Fail("the dynamic access key is missing server details")
     if method not in SS_METHODS:
         raise Fail(f"unsupported encryption method {clean(method, 40)!r}")
-    return {"server": host, "server_port": port, "method": method, "password": password, "name": None}
+    srv = {"server": host, "server_port": port, "method": method, "password": password, "name": None}
+    if d.get("prefix"):
+        srv["prefix"] = ss_prefix(str(d["prefix"]), method)
+    return srv
 
 
 def outline_from_key(key):
@@ -540,9 +558,12 @@ def write_outline_conf(cfg):
                     fresh["outline"] = new
                     write_json(VPN_JSON, fresh)
             cfg["outline"] = o = new
+    server = {"server": o["server"], "server_port": o["server_port"],
+              "password": o["password"], "method": o["method"], "timeout": 300}
+    if o.get("prefix"):
+        server["prefix"] = o["prefix"]  # bin/outline-client then runs mariner-ss instead of sslocal
     write_secret(OUTLINE_CONF, json.dumps({
-        "servers": [{"server": o["server"], "server_port": o["server_port"],
-                     "password": o["password"], "method": o["method"], "timeout": 300}],
+        "servers": [server],
         "locals": [{"local_address": SOCKS.split(":")[0], "local_port": int(SOCKS.split(":")[1]),
                     "protocol": "socks", "mode": "tcp_and_udp"}],
     }, indent=1))
@@ -914,7 +935,20 @@ def tunnel_dev(provider):
     return SANDBOX[provider]["host_if"] if provider in SANDBOX else TUN_IF
 
 
-def nft_ruleset(block, dns_tunnel, provider="geph", sandbox_dns=False, allow_ips=()):
+def vpn_server_bypass(cfg, provider):
+    """The Outline server's address when hotspot traffic to it should go direct.
+    A phone or laptop running its own Outline client to the same server can't
+    reach it through the tunnel (the server won't connect to itself); that
+    traffic is Shadowsocks-encrypted already."""
+    if provider != "outline":
+        return None
+    try:
+        return str(ipaddress.IPv4Address((cfg.get("outline") or {}).get("server", "")))
+    except ValueError:
+        return None
+
+
+def nft_ruleset(block, dns_tunnel, provider="geph", sandbox_dns=False, allow_ips=(), bypass_ip=None):
     """The whole `inet mariner` table.
 
     block: kill switch (hotspot traffic may only leave through the tunnel).
@@ -927,14 +961,20 @@ def nft_ruleset(block, dns_tunnel, provider="geph", sandbox_dns=False, allow_ips
     hs = ", ".join(f'"{i}"' for i in hotspot_ifs())
     allow = ", ".join(allow_ips)
     forward = ""
-    if provider == "geph":
-        # Geph's exits refuse QUIC (HTTP/3 over UDP 443), but silently: browsers
-        # wait seconds before falling back to TCP. Refuse it here at once instead.
+    if provider in ("geph", "outline"):
+        # Geph's exits refuse QUIC (HTTP/3 over UDP 443) silently, and in China
+        # Outline's UDP is often throttled in bursts while its prefixed TCP keeps
+        # working. Either way browsers stall before falling back to TCP; refuse
+        # QUIC here at once instead.
         forward += (f'        iifname {{ {hs} }} oifname "{TUN_IF}" udp dport 443 '
-                    'counter reject comment "geph: no QUIC, use TCP now"\n')
+                    f'counter reject comment "{provider}: no QUIC, use TCP now"\n')
     if block:
         if allow:
             forward += f'        ip saddr {{ {allow} }} counter accept comment "login window"\n'
+        if bypass_ip:
+            # Whichever uplink the main table uses (Wi-Fi, or ethernet at home).
+            forward += (f'        iifname {{ {hs} }} ip daddr {bypass_ip} '
+                        'counter accept comment "own Outline server"\n')
         forward += (f'        iifname {{ {hs} }} oifname != {{ {hs}, "{tunnel_dev(provider)}" }} '
                     'counter drop comment "killswitch"\n')
     dns_to = f"{SANDBOX[provider]['ns_ip']}:5354" if sandbox_dns and provider in SANDBOX else "10.42.0.1:5354"
@@ -996,7 +1036,14 @@ table inet mariner {{
 """
 
 
-def apply_routing(route_tunnel, provider="geph", allow_ips=()):
+def apply_routing(route_tunnel, provider="geph", allow_ips=(), bypass_ip=None):
+    have = sh("ip", "rule", "show", "priority", str(BYPASS_PRIO), check=False)
+    want = bypass_ip if route_tunnel else None
+    if have and (not want or f"to {want} " not in have + " "):
+        sh("ip", "rule", "del", "priority", str(BYPASS_PRIO), check=False)
+        have = ""
+    if want and not have:
+        sh("ip", "rule", "add", "priority", str(BYPASS_PRIO), "from", HOTSPOT_NET, "to", want, "lookup", "main")
     # Login-window devices: straight to the main table (wlan0), ahead of the
     # VPN rules. One rule per device at 900, 901, ...
     allow = {ALLOW_PRIO + n: ip for n, ip in enumerate(allow_ips[:10])} if route_tunnel else {}
@@ -1063,6 +1110,7 @@ def reconcile(units=True, wait=False):
     has_creds = configured(cfg, provider)
     want_run = cfg["enabled"] and has_creds and portal != "portal"
     block = cfg["enabled"] and cfg["killswitch"]
+    bypass = vpn_server_bypass(cfg, provider)
 
     # Fail closed: if the kill switch should be on, block first, before any
     # slow or failing service handling (also covers boot, where nothing else
@@ -1070,8 +1118,8 @@ def reconcile(units=True, wait=False):
     if block:
         sandbox_dns = (provider in SANDBOX and want_run and link_exists(SANDBOX[provider]["host_if"])
                        and sandbox_tunnel_present(provider))
-        apply_routing(True, provider, allow_ips)
-        sh("nft", "-f", "-", input=nft_ruleset(True, True, provider, sandbox_dns, allow_ips))
+        apply_routing(True, provider, allow_ips, bypass)
+        sh("nft", "-f", "-", input=nft_ruleset(True, True, provider, sandbox_dns, allow_ips, bypass))
 
     unit_error = None
     try:
@@ -1100,9 +1148,9 @@ def reconcile(units=True, wait=False):
     route_tunnel = (tun_up and cfg["enabled"]) or block
     dns_tunnel = route_tunnel
 
-    apply_routing(route_tunnel, provider, allow_ips)
+    apply_routing(route_tunnel, provider, allow_ips, bypass)
     sh("nft", "-f", "-", input=nft_ruleset(block, dns_tunnel, provider,
-                                           provider in SANDBOX and tun_up, allow_ips))
+                                           provider in SANDBOX and tun_up, allow_ips, bypass))
     state = reconcile_state(cfg, provider, portal, has_creds, block, route_tunnel, dns_tunnel, tun_up, win, works)
     if unit_error and units:
         raise Fail(str(unit_error))
@@ -1320,6 +1368,34 @@ def cmd_vpn_speedtest(args):
         lock.close()
 
 
+def log_tunnel_failure(cfg):
+    """Journal one line saying how a failed SOCKS-tunnel probe failed: whether the
+    Outline server is reachable at all from the uplink (a blocked server times out
+    here) and the error a fetch through the tunnel gets."""
+    stamp = f"{RUN}/tunnel-failure-logged"
+    try:
+        if time.time() - os.path.getmtime(stamp) < 300:
+            return  # at most every 5 minutes: each run can take ~13 s
+    except OSError:
+        pass
+    open(stamp, "w").close()
+    parts = []
+    o = cfg.get("outline") or {}
+    if cfg["provider"] == "outline" and o.get("server"):
+        t = time.monotonic()
+        try:
+            socket.create_connection((o["server"], int(o["server_port"])), timeout=5).close()
+            parts.append(f"server {o['server']}:{o['server_port']} TCP ok in {(time.monotonic() - t) * 1000:.0f} ms")
+        except OSError as e:
+            parts.append(f"server {o['server']}:{o['server_port']} TCP failed after "
+                         f"{time.monotonic() - t:.1f} s: {e.strerror or e}")
+    p = subprocess.run(["curl", "-sS", "-o", "/dev/null", "-m", "8", "--socks5-hostname", SOCKS,
+                        "https://cloudflare-dns.com/"], capture_output=True, text=True, timeout=12)
+    parts.append(f"fetch through tunnel: curl exit {p.returncode} ({clean(p.stderr.strip(), 120) or 'no error'})")
+    subprocess.run(["logger", "-t", "mariner-ctl", f"{PROVIDERS[cfg['provider']]['name']} probe failed; "
+                    + "; ".join(parts)], check=False)
+
+
 def geo_lookup(*curl_args, runner=()):
     """Public IPv4 + location as seen from the internet, via the given curl path.
 
@@ -1379,6 +1455,8 @@ def vpn_probe(force=False, count_fail=True):
         geo = geo_lookup(runner=("ip", "netns", "exec", "warp"))
     else:
         geo = geo_lookup("--socks5-hostname", SOCKS)
+        if not geo and count_fail:  # not during the quick retries right after a connect
+            log_tunnel_failure(cfg)
     res = {"at": int(time.time()), "provider": cfg["provider"], "invocation": invocation, "ok": bool(geo),
            "fails": 0 if geo else ((prev.get("fails", 0) if same else 0) + (1 if count_fail else 0)),
            **(geo or {})}
@@ -1430,7 +1508,8 @@ def vpn_status():
     o = cfg.get("outline")
     if o:
         st["outline"] = {"name": o.get("name"), "server": o.get("server"), "port": o.get("server_port"),
-                         "method": o.get("method"), "dynamic": o.get("dynamic")}
+                         "method": o.get("method"), "dynamic": o.get("dynamic"),
+                         "prefix": bool(o.get("prefix"))}
     # The saved setting is written first; VPN_STATE only after reconcile has
     # finished (which can take a while). Show the user's choice immediately.
     if st.get("enabled") != cfg["enabled"] or st.get("provider") not in (None, provider):

@@ -52,7 +52,8 @@ Mariner supports four VPN services, one at a time. You switch between them with 
 
 Notes:
 - Geph uses IPv4 bridges only by default: on a network with IPv6, its IPv6 bridges measured around 1 Mbit/s against 70-90 Mbit/s over IPv4. If Geph can't connect somewhere IPv4 bridges are blocked, turn on **Allow IPv6 bridges** on the VPN page.
-- Outline keys that use the `prefix=` disguise aren't supported yet.
+- Outline keys with the `prefix=` disguise (e.g. Outline's TLS ClientHello prefix `%16%03%01%00%C2%A8%01%01`) run through `mariner-ss`, a small Outline-SDK client (`tools/mariner-ss`), because shadowsocks-rust can't send a prefix. In China a key without a prefix may connect and then stall after a few packets; adding the prefix to the key fixes that.
+- Hotspot traffic to the Outline server's own address goes direct, so a laptop running its own Outline client to the same server keeps working while Mariner's Outline is on (the server can't connect to itself through the tunnel).
 - ExpressVPN's own Lightway protocol works, but it runs at only about 1–2 Mbit/s on a Pi 4, so Mariner defaults to WireGuard.
 - WARP hides your traffic from the local network and gets around many blocks, but it isn't built for anonymity or for picking a country: you exit near where you are.
 - Mariner isn't affiliated with Geph, Outline (Jigsaw/Google), ExpressVPN or Cloudflare.

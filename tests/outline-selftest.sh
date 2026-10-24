@@ -9,8 +9,9 @@ set -euo pipefail
 LIB=/usr/local/lib/mariner
 PW=$(head -c 16 /dev/urandom | base64 | tr -d '/+=')
 SRV_PORT=18388 SOCKS_PORT=19909 METHOD=chacha20-ietf-poly1305
+URL=${URL:-https://example.com}   # in China: URL=https://www.baidu.com
 work=$(mktemp -d)
-cleanup() { kill "${SRV:-}" "${CLI:-}" 2>/dev/null || true; rm -rf "$work"; }
+cleanup() { kill "${SRV:-}" "${CLI:-}" "${MSS:-}" 2>/dev/null || true; rm -rf "$work"; }
 trap cleanup EXIT
 
 ssserver -U -s "127.0.0.1:$SRV_PORT" -k "$PW" -m "$METHOD" >"$work/server.log" 2>&1 &
@@ -26,7 +27,7 @@ keys=(
 )
 
 python3 - "$work" "$SOCKS_PORT" "${keys[@]}" <<'EOF'
-import importlib.machinery, importlib.util, json, sys
+import base64, importlib.machinery, importlib.util, json, sys
 loader = importlib.machinery.SourceFileLoader("ctl", "/usr/local/lib/mariner/bin/mariner-ctl")
 spec = importlib.util.spec_from_loader("ctl", loader)
 ctl = importlib.util.module_from_spec(spec)
@@ -46,12 +47,19 @@ for bad in ("ss://abc", "ss://Y2hhY2hhMjA6eA@1.2.3.4:443/?prefix=%16%03", "http:
 ctl.OUTLINE_CONF = f"{work}/outline.json"
 ctl.SOCKS = f"127.0.0.1:{port}"
 ctl.write_outline_conf({"outline": ctl.outline_from_key(keys[0])})
+# Outline's documented TLS ClientHello prefix; %C2%A8 is one byte (0xA8).
+o = ctl.outline_from_key(keys[0].replace("?outline=1", "?outline=1&prefix=%16%03%01%00%C2%A8%01%01"))
+assert base64.b64decode(o["prefix"]) == bytes.fromhex("16030100a80101"), o.get("prefix")
+print("prefix parsed ok: 16 03 01 00 a8 01 01")
+ctl.OUTLINE_CONF = f"{work}/outline-prefix.json"
+ctl.SOCKS = f"127.0.0.1:{int(port) + 1}"
+ctl.write_outline_conf({"outline": o})
 EOF
 
 sslocal -c "$work/outline.json" >"$work/client.log" 2>&1 &
 CLI=$!
 sleep 1
-echo "through sslocal -> ssserver: $(curl -s -m 10 --socks5-hostname 127.0.0.1:$SOCKS_PORT -o /dev/null -w '%{http_code}' https://example.com)"
+echo "through sslocal -> ssserver: $(curl -s -m 10 --socks5-hostname 127.0.0.1:$SOCKS_PORT -o /dev/null -w '%{http_code}' "$URL")"
 echo "UDP (DNS) through sslocal:   $(python3 - "$SOCKS_PORT" <<'EOF'
 import socket, struct, sys
 port = int(sys.argv[1])
@@ -66,3 +74,9 @@ d, _ = u.recvfrom(2048)
 print("answer received" if d[10:12] == b"\x12\x34" else "bad answer")
 EOF
 )"
+# Prefix key: the same wrapper outline-ss.service runs must pick mariner-ss.
+"$LIB/bin/outline-client" "$work/outline-prefix.json" >"$work/mss.log" 2>&1 &
+MSS=$!
+sleep 1
+head -1 "$work/mss.log"
+echo "prefix key through mariner-ss -> ssserver: $(curl -s -m 10 --socks5-hostname 127.0.0.1:$((SOCKS_PORT + 1)) -o /dev/null -w '%{http_code}' "$URL")"

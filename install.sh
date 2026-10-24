@@ -200,6 +200,13 @@ if [ -x "$GEPH_SRC" ] && ! cmp -s "$GEPH_SRC" /usr/local/bin/geph5-client; then
 fi
 [ -x /usr/local/bin/geph5-client ] || echo "note: Geph isn't installed (geph5-client missing); Outline/ExpressVPN still work" >&2
 [ -x /usr/local/bin/tun2socks ] || echo "warning: /usr/local/bin/tun2socks missing" >&2
+# mariner-ss (Outline keys with a prefix) is built off the Pi; see tools/mariner-ss/README.md.
+MSS_SRC=tools/mariner-ss/mariner-ss-linux-arm64
+if [ -x "$MSS_SRC" ] && ! cmp -s "$MSS_SRC" /usr/local/bin/mariner-ss; then
+    install -m 0755 "$MSS_SRC" /usr/local/bin/mariner-ss
+    echo "installed mariner-ss"
+fi
+[ -x /usr/local/bin/mariner-ss ] || echo "note: mariner-ss missing; Outline keys with a prefix won't work" >&2
 
 # ExpressVPN (optional; installed separately with its own installer, see
 # README): its daemon only ever runs inside the evpn sandbox, and only when

@@ -1,0 +1,14 @@
+#!/bin/sh
+# Outline client for outline-ss.service (SOCKS5 on 127.0.0.1:9909).
+# Keys with Outline's prefix disguise need mariner-ss (Outline SDK); sslocal
+# (shadowsocks-rust) can't send a prefix. Everything else keeps sslocal, which
+# also covers the 2022-blake3 methods the Outline SDK lacks.
+cfg="$1"
+if jq -e '.servers[0].prefix // empty' "$cfg" >/dev/null 2>&1; then
+    if [ ! -x /usr/local/bin/mariner-ss ]; then
+        echo "this Outline key has a prefix, but /usr/local/bin/mariner-ss is missing (see tools/mariner-ss)" >&2
+        exit 1
+    fi
+    exec /usr/local/bin/mariner-ss -c "$cfg"
+fi
+exec /usr/local/bin/sslocal --log-without-time -c "$cfg"

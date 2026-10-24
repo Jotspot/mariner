@@ -8,3 +8,4 @@ portal.conf
 __pycache__/
 *.pyc
 .venv/
+tools/mariner-ss/mariner-ss-linux-arm64

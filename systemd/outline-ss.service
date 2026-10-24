@@ -1,5 +1,5 @@
 [Unit]
-Description=Outline client: shadowsocks-rust sslocal (SOCKS5 on 127.0.0.1:9909)
+Description=Outline client: sslocal, or mariner-ss for prefix keys (SOCKS5 on 127.0.0.1:9909)
 PartOf=mariner-vpn-outline.target
 After=network-online.target
 
@@ -8,7 +8,7 @@ After=network-online.target
 # unprivileged dynamic user.
 DynamicUser=yes
 LoadCredential=outline.json:/etc/mariner/outline.json
-ExecStart=/usr/local/bin/sslocal --log-without-time -c ${CREDENTIALS_DIRECTORY}/outline.json
+ExecStart=/usr/local/lib/mariner/bin/outline-client ${CREDENTIALS_DIRECTORY}/outline.json
 Restart=always
 RestartSec=10
 NoNewPrivileges=yes
