@@ -5,6 +5,8 @@
 #   tun2socks   xjasonlyu/tun2socks       (VPN tunnel interface vpn0)
 #   sslocal     shadowsocks/shadowsocks-rust (Outline client)
 #   ssserver    shadowsocks/shadowsocks-rust (only for tests/outline-test-server.sh)
+#   mariner-ss  this repo's tools/mariner-ss, a GitHub release of this repo
+#               (Outline keys with a prefix; built reproducibly, see its README)
 #
 # geph5-client has no prebuilt ARM64 release; it is built with cargo (README).
 set -euo pipefail
@@ -14,6 +16,9 @@ TUN2SOCKS_VER=v2.7.0
 TUN2SOCKS_SHA=3931476c9cfa8fa236d23aeaf36767df0eb27cc11ecaab699faba57744450f49
 SS_VER=v1.25.0
 SS_SHA=9c3b7fd2df1b7fd12cd80bb3b57d9de98a0fb526921669c3ac40587b88be3009
+MSS_VER=0.1.0
+MSS_SHA=0d060d958bd9727721b224538360cf9daa929cdda52bbce79ee2ddd9a9772aca
+REPO_DIR=$(cd "$(dirname "$0")/.." && pwd)
 
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
@@ -40,4 +45,16 @@ elif [ "$(/usr/local/bin/sslocal --version 2>/dev/null)" != "shadowsocks ${SS_VE
     tar -xJf ss.tar.xz sslocal ssserver
     install -m 0755 sslocal ssserver /usr/local/bin/
     echo "installed shadowsocks-rust $SS_VER (sslocal, ssserver)"
+fi
+
+# mariner-ss: a local build in the checkout wins (development; install.sh
+# installs it); otherwise the pinned release.
+if [ "${MARINER_OUTLINE:-yes}" = no ]; then
+    :
+elif [ -x "$REPO_DIR/tools/mariner-ss/mariner-ss-linux-arm64" ]; then
+    echo "using the local mariner-ss build (tools/mariner-ss)"
+elif [ "$(/usr/local/bin/mariner-ss -version 2>/dev/null)" != "mariner-ss $MSS_VER" ]; then
+    fetch "https://github.com/Jotspot/mariner/releases/download/mariner-ss-v$MSS_VER/mariner-ss-linux-arm64"           "$MSS_SHA" mariner-ss
+    install -m 0755 mariner-ss /usr/local/bin/mariner-ss
+    echo "installed mariner-ss $MSS_VER"
 fi

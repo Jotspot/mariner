@@ -45,7 +45,7 @@ There's no unit-test suite or linter. Syntax-check locally, then test on the Pi:
 
 ## Gotchas learned the hard way
 
-- Outline prefix keys: shadowsocks-rust silently ignores unknown config fields, so an sslocal "accepts" a prefix field without sending it. `bin/outline-client` runs `mariner-ss` (Outline SDK, `tools/mariner-ss`, cross-built on a PC) when the generated config has `prefix`. Outline encodes the prefix as one byte per character (`%C2%A8` is 0xA8, not two bytes).
+- Outline prefix keys: shadowsocks-rust silently ignores unknown config fields, so an sslocal "accepts" a prefix field without sending it. `bin/outline-client` runs `mariner-ss` (Outline SDK, `tools/mariner-ss`; installed from this repo's GitHub release `mariner-ss-v<ver>` by `tools/fetch-binaries.sh`, pinned by SHA-256, reproducible build) when the generated config has `prefix`. Outline encodes the prefix as one byte per character (`%C2%A8` is 0xA8, not two bytes).
 - `tun2socks` needs double-dash long flags (`--device`, `--proxy`); single-dash flags fail.
 - `journalctl -t X -u Y` ANDs the matches. Use field matches joined with `+` to OR them (`_any_of()` in `mariner-ctl`).
 - `nmcli -g a,b` prints one field per line. NetworkManager's netplan backend can't keep `interface-name` on netplan-born profiles (it saves `match: {}`).

@@ -44,6 +44,9 @@ type config struct {
 	} `json:"locals"`
 }
 
+// version is set at build time (-ldflags "-X main.version=...") for releases.
+var version = "dev"
+
 var (
 	streamDialer   *shadowsocks.StreamDialer
 	packetListener transport.PacketListener
@@ -53,7 +56,12 @@ var (
 func main() {
 	log.SetFlags(0)
 	cfgPath := flag.String("c", "", "config file (sslocal-style JSON)")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Println("mariner-ss", version)
+		return
+	}
 	raw, err := os.ReadFile(*cfgPath)
 	if err != nil {
 		log.Fatalf("reading config: %v", err)
